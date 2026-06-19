@@ -146,7 +146,7 @@ public class SampleWebServer {
         }
         else {
             String alias = keyStore.aliases().nextElement();
-            System.out.println("Using certificate with alias " + alias + " from keystore");
+            System.out.println("Using certificate with alias '" + alias + "' from keystore");
             builder.withKeyStore(keyStore, alias, keyStorePassword.toCharArray());
         }
 
