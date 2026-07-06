@@ -149,9 +149,9 @@ change shape, not just their source of keys.
   server pos/neg test (ADVICE item D) is an **Inc-0/1 predecessor**: server mTLS is
   present-but-untested today (§6). End-to-end trace of the SPIFFE reuse this wiring depends on:
   `SSLContext(JGDMS AuthManager) → QuicTLSContext → engine → CertificateRequest → client
-  Certificate → server checkClientTrusted (SPIFFE-SAN match)` — this trace only **closes** once
-  DirtyChai's B1/B2/B3 land (§6); until then the server-side leg fails at `QuicTLSContext`
-  construction (B1) or at the trust-dispatch branch (B2/B3).
+  Certificate → server checkClientTrusted (SPIFFE-SAN match)` — this trace's DirtyChai
+  dependencies (B1/B2/B3) landed in trunk `98bcc58115f` (§6.1); the remaining predecessor is the
+  functional mTLS-server test (ADVICE item D).
 
 ### 3.4 Transport-parameter seam
 
@@ -229,7 +229,7 @@ change shape, not just their source of keys.
 
 | Inc | Deliverable |
 |---|---|
-| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 + mTLS-server pos/neg test (ADVICE item D) land as a **predecessor gate**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) lands clean. |
+| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 landed (trunk `98bcc58115f`, §6.1); the mTLS-server pos/neg test (ADVICE item D) remains a **predecessor**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) lands clean. |
 | 1 | INITIAL+HANDSHAKE handshake completes client↔server over loopback; engine does AEAD; `getSession().getPeerCertificates()` populated both ends. |
 | 2 | ONE_RTT application data; streams carry payload end-to-end; `setOneRttContext` wired (§3.3). |
 | **H** | **Adversarial-input hardening pass on the kept transport** (new — before Inc 3 mTLS; see §7.3a): fuzz harness + line-by-line audit sign-off of the nine kept transport packages; anti-amplification / Retry / stateless-reset re-verification (server/impl driver rewrite). |
@@ -240,34 +240,38 @@ change shape, not just their source of keys.
 
 ## 6. Runtime, dependency, and DirtyChai coupling
 
-### 6.1 DirtyChai side — B1/B2/B3: REQUIRED, NOT DONE (critical correction)
+### 6.1 DirtyChai side — B1/B2/B3: DONE and verified (mTLS-server test still outstanding)
 
-**Prior text in this SOW stated B1/B2/B3 were "all done." That was FALSE against current DirtyChai
-trunk and is corrected here.** Verified current state:
+**History note (why this section is emphatic):** an earlier draft of this SOW asserted B1/B2/B3
+were "all done" as a bare claim; a board review found that FALSE against the then-current trunk.
+They have since been implemented and are now **verified against DirtyChai trunk `98bcc58115f`**
+(commit *"QUIC-TLS Exposure for JGDMS & Kwik #228"*). The lesson stands: cite verified source
+state, not a self-report.
 
-- **B1 — NOT done.** `SSLContextImpl.isUsableWithQuic()` still returns
-  `trustManager instanceof X509TrustManagerImpl`. JGDMS's `AuthManager` is wrapped, on
-  `SSLContext.init()`, as an `X509ExtendedTrustManager` — **not** an `X509TrustManagerImpl` — so it
-  fails this gate. The failure occurs at `QuicTLSContext` **construction**: the engine cannot even
-  be built from a JGDMS `SSLContext` today.
-- **B2 — NOT done.** `CertificateMessage`'s QUIC trust-dispatch branch still throws
-  `"QUIC only supports SunJSSE trust managers"` for any manager that isn't `X509TrustManagerImpl`.
-  No `SSLEngine`-adapter branch exists yet to route a custom `X509ExtendedTrustManager` through the
-  standard 3-arg dispatch.
-- **B3 — NOT done, and it is fail-OPEN.** The server-side client-cert validation block has **no
-  final `else`** after the `QuicTLSEngineImpl` branch: an unrecognized transport falls straight
-  through to `setPeerCertificates` with **no validation performed**, admitting the client cert
-  **unvalidated**. The client-side block has the fail-secure `else throw new
-  AssertionError("Unexpected transport type")` pattern; the server-side block does not.
+Verified current state (trunk `98bcc58115f`):
 
-**Consequence:** none of B1, B2, or B3 exist in DirtyChai trunk today. This SOW's Inc 0 therefore
-has an **explicit predecessor gate**: *DirtyChai lands B1 + B2 + B3 + the mTLS-server pos/neg test
-(ADVICE item D)* before this fork's server-mTLS work (Inc 3) can be validated end-to-end, and
-before Inc 0 can be called complete. **Named owner:** a human DirtyChai maintainer (DirtyChai is
-advise-only for AI; humans write the fix per its `CLAUDE.md` policy) — this SOW cannot assign or
-schedule that work, only depend on it. **This is the schedule's critical-path risk**: it is a
-cross-repo dependency on advise-only human effort in a repo this SOW's author does not control the
-pace of. Track it explicitly; do not assume it lands on this fork's timeline (see §7.2).
+- **B1 — DONE.** `SSLContextImpl.isUsableWithQuic()` (`:486`) now returns
+  `trustManager instanceof X509ExtendedTrustManager`. JGDMS's `AuthManager` (wrapped on
+  `SSLContext.init()` as an `X509ExtendedTrustManager`) passes the gate, so the engine can be built
+  from a JGDMS `SSLContext`.
+- **B2 — DONE.** `CertificateMessage` routes a custom (non-`X509TrustManagerImpl`)
+  `X509ExtendedTrustManager` through the standard 3-arg dispatch via a new `QuicTLSEngineFacadeImpl`
+  adapter — on both the server client-cert path (`checkClientTrusted`, `:1232`) and the client
+  server-cert path (`checkServerTrusted`, `:1296`). The old `"QUIC only supports SunJSSE trust
+  managers"` throw is retired.
+- **B3 — DONE (fail-open closed).** The server-side client-cert transport dispatch now ends in
+  `else { throw new AssertionError("Unexpected transport type"); }` (`:1236-1238`), symmetric with
+  the client-side block. An unrecognized transport can no longer fall through to
+  `setPeerCertificates` unvalidated — it fails closed.
+
+**Remaining Inc-0 predecessor.** The *code* relaxations are done; commit #228 did **not** add a
+functional test. The one outstanding predecessor is the **DirtyChai mTLS-server pos/neg test
+(ADVICE item D)** — server mTLS is now code-complete but **unexercised**. **Owner:** a human
+DirtyChai maintainer (DirtyChai is advise-only for AI; humans write it per its `CLAUDE.md` policy).
+This is no longer a blocking-code gate for the fork's design work, but Inc 3 (server-mTLS SPIFFE
+pos/neg) should not be called validated end-to-end until that DirtyChai test exists. It is a much
+smaller residual than the original B1/B2/B3 critical path (see §7.2). Also still pending on the
+DirtyChai side: the one-line qualified export (§6.3), which #228 did not add.
 
 ### 6.2 Architecture decision (ratified 2026-07-06) — direct `jdk.internal.net.quic` + `QuicTlsPort`, facade override acknowledged
 
@@ -312,8 +316,8 @@ port's own signatures, not just its implementation.
 
 ### 6.3 Export line and SPI surface
 
-- DirtyChai side, once B1/B2/B3 land (§6.1): **one line** in DirtyChai's `module-info.java` — add
-  `tech.kwik.core` to `exports jdk.internal.net.quic to java.net.http;`. No driver facade is built
+- DirtyChai side, now that B1/B2/B3 have landed (§6.1): **one line** still pending in DirtyChai's
+  `module-info.java` — add `tech.kwik.core` to `exports jdk.internal.net.quic to java.net.http;`. No driver facade is built
   (§6.2); the fork compiles against `jdk.internal.net.quic.QuicTLSEngine` directly and versions in
   lockstep with DirtyChai.
 - **Every type on the engine's SPI signatures lives in `jdk.internal.net.quic`** (verified:
@@ -420,8 +424,8 @@ if the spike surfaces a harder reconciliation than expected, re-scope before com
 
 **Explicitly EXCLUDED from this estimate** (both were already out of scope for the 6–8-week floor,
 restated here so the correction doesn't get read as absorbing them):
-- the **human DirtyChai B1/B2/B3 + mTLS-test critical path** (§6.1) — a separate repo, on
-  advise-only human effort this SOW does not control the pace of;
+- the **human DirtyChai mTLS-server test (ADVICE item D)** (§6.1; B1/B2/B3 have landed) — a
+  separate repo, on advise-only human effort this SOW does not control the pace of;
 - the **JGDMS `Endpoint`/`ServerEndpoint` SPI + STD-010 conformance work layered on top** —
   server-initiated streams, DGC in-band ack, execution-subject swap.
 
