@@ -114,6 +114,16 @@ change shape, not just their source of keys.
   (server) / `tryReceiveHandshakeDone()` (client) and `versionNegotiated(...)`. Replace both engine
   construction sites (client and server) with port construction over the JDK engine. This is the
   largest and trickiest item; scope it by reading the two connection state machines first.
+- **HANDSHAKE_DONE completion (empirically confirmed 2026-07-06 by the JGDMS `QuicEngineMtlsTest`
+  engine-pair test).** `isTLSHandshakeComplete()` is NOT the same as `HANDSHAKE_CONFIRMED`: the
+  server engine stays at `NEED_SEND_HANDSHAKE_DONE` (TLS complete, 1-RTT keys available) until the
+  transport actually carries the QUIC HANDSHAKE_DONE frame — so the driver must issue
+  `tryMarkHandshakeDone()` (server) / `tryReceiveHandshakeDone()` (client) as a real transport step,
+  not merely poll TLS completion. Also confirmed by that test: construction is
+  `new QuicTLSContext(sslContext).createEngine()` gated by `isQuicCompatible` (needs TLSv1.3); the
+  engine rejects a handshake without the transport-parameters extension (`0x016d missing_extension`)
+  — an empty `ByteBuffer.allocate(0)` + a registered `setRemoteQuicTransportParametersConsumer`
+  suffices — and requires `versionNegotiated(QUIC_V1)`.
 - **GAP-3 (delegated tasks):** the engine's `getDelegatedTask()` is a no-op returning `null` while
   `useDelegatedTask()` returns `true`. The driver **MUST NOT** block-loop on `NEED_TASK`; trust work
   (e.g. cert validation) runs inline. Acceptable on the virtual-thread model — but write the driver
