@@ -42,7 +42,13 @@ Everything else is transport. The fork keeps the transport and re-points those t
 JDK engine. Confirmed against this fork's source: the agent15 dependency is concentrated in
 crypto, connection orchestration, transport-params, and session-tickets; the transport machinery
 (`ack`, `cc`, `cid`, `frame`, `packet`, `recovery`, `send`, `receive`, `stream`) does **not** import
-agent15 and is kept as-is.
+agent15 directly.
+
+**Caveat — `packet` is not untouched.** `packet` does not *import* agent15, but it *consumes* the
+`Aead` objects that `ConnectionSecrets` (being deleted, §3.2) produces: `QuicPacket` calls
+`aeadEncrypt` / `createHeaderProtectionMask` etc. against those objects. `packet` is therefore part
+of the crypto-seam change surface, not untouched transport — see §3.2 for the re-architecture this
+implies.
 
 ---
 
@@ -56,16 +62,39 @@ Define **one** internal interface in the fork — e.g. `tech.kwik.core.tls.QuicT
 (JEP 517 flags this as future work), conversion is a single-file swap, and the transport becomes
 unit-testable against a mock port.
 
-### 3.2 Crypto seam — delegate AEAD to the engine
+### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's fused calls
 
-- **Files:** `core/.../crypto/ConnectionSecrets.java`, `core/.../crypto/CryptoStream.java`.
+**This is a re-architecture of `packet` + both packet parsers, not a deletion.** kwik and the
+engine protect packets under **different shapes**: kwik's `QuicPacket` performs protection in
+**two caller-driven steps** — payload `aeadEncrypt` (kwik computes the nonce and does the AEAD
+call itself against secrets it derived) plus a separate `createHeaderProtectionMask` (kwik samples
+the ciphertext and XORs the mask into the header itself) — whereas the engine offers a **single
+fused call** per direction: `encryptPacket(...)` / `decryptPacket(...)` do nonce handling, AEAD,
+*and* header-protection sampling/masking in one call (`computeHeaderProtectionMask` is also
+available standalone where the fused call isn't the fit). Reconciling kwik's two-step model with
+the engine's fused model is a rewrite of `QuicPacket` and both packet parsers — the call sites
+change shape, not just their source of keys.
+
+- **Files:** `core/.../crypto/ConnectionSecrets.java`, `core/.../crypto/CryptoStream.java`,
+  `core/.../packet/QuicPacket.java` (+ both packet parsers — see §2 caveat).
 - **Today:** kwik pulls raw traffic secrets from agent15 (`getClientHandshakeTrafficSecret()` …),
   derives its own AEAD keys via HKDF, and builds its own `Aes128Gcm` / `Aes256Gcm` /
-  `ChaCha20Poly1305` ciphers to protect packets.
-- **Change:** delete the key-derivation and AEAD construction; delegate packet protection to the
-  engine via the port: `encryptPacket` / `decryptPacket` / `computeHeaderProtectionMask` /
-  `getHeaderProtectionSampleSize` / `getAuthTagSize` / `deriveInitialKeys` / `keysAvailable` /
-  `discardKeys`. **Raw secrets are never requested** — this is the security point of the fork.
+  `ChaCha20Poly1305` ciphers, then calls its own two-step protect/unprotect from `QuicPacket`.
+- **Change:** delete the key-derivation and AEAD construction in `ConnectionSecrets`; re-point
+  `QuicPacket`'s two-step call sites onto the engine's fused calls via the port: `encryptPacket` /
+  `decryptPacket` / `computeHeaderProtectionMask` / `getHeaderProtectionSampleSize` /
+  `getAuthTagSize` / `deriveInitialKeys` / `keysAvailable` / `discardKeys`. **Raw secrets are never
+  requested** — this is the security point of the fork.
+- **KEY-UPDATE — explicit deletion, not adaptation.** The 1-RTT key-phase ratchet lives
+  transport-side today: `KeyUpdateSupport` plus `ShortHeaderPacket`'s key-phase logic
+  (`getKeyPhase`, `confirmKeyUpdateIfInProgress`, `computeNextApplicationTrafficSecret`). This
+  machinery **MUST be deleted**, not re-pointed: the engine owns the key-update ratchet itself via
+  `decryptPacket(KeySpace, packetNumber, keyPhase, …)` (per-packet key-phase-aware decrypt) plus
+  `setOneRttContext(QuicOneRttContext)` (§3.3). **WARN:** if this item is read literally as "keep
+  the transport, just re-point the AEAD calls," a developer will leave **two key-phase
+  authorities racing** — kwik's own ratchet and the engine's — which is both a correctness hazard
+  (disagreeing on which keys are current) and a secrecy hazard (stale/duplicate key material). The
+  transport-side ratchet must be removed, full stop.
 - **Dependency cleanup:** `at.favre.lib.hkdf` likely drops (engine derives keys). `io.whitfin.siphash`
   stays (stateless retry token / connection-ID, transport-side). Verify before removing from
   `module-info`.
@@ -89,6 +118,40 @@ unit-testable against a mock port.
   `useDelegatedTask()` returns `true`. The driver **MUST NOT** block-loop on `NEED_TASK`; trust work
   (e.g. cert validation) runs inline. Acceptable on the virtual-thread model — but write the driver
   knowing no task will ever be handed back.
+- **Omitted engine SPI methods — add to the driver seam (ADVICE enumeration):**
+  - `setOneRttContext(QuicOneRttContext)` — supplies the engine's 1-RTT key-update context; gates
+    **Inc 2** (ONE_RTT application data / key updates).
+  - `restartHandshake()` — restarts the handshake after Version Negotiation; gates **Inc 4**
+    (Version-Negotiation path).
+  - `getCurrentSendKeySpace()` — the driver needs this to know which `KeySpace` to send the next
+    outbound packet in.
+  - `signRetryPacket(...)` / `verifyRetryPacket(...)` — Retry-**packet** integrity is
+    **engine-owned**, driven through the port alongside the other handshake-drive calls. This is
+    separate from the §3.2 SipHash retention: SipHash stays for **connection-ID** hashing
+    (stateless CID generation) only, not for Retry-token/packet integrity, which the engine signs
+    and verifies.
+- **Server handshake-completion deadline (DoS) — Inc-3 acceptance criterion.** Because
+  `getDelegatedTask()` is a permanent no-op (GAP-3), certificate validation (PKIX chain-path,
+  possibly CRL/OCSP, plus SPIFFE-SAN matching) runs **inline on the handshake-drive thread**. kwik's
+  existing DoS defenses don't cover this: `abortHandshake` is **client-only**; the server side has
+  only `maxIdleTimeout` (idle timeout is not a handshake-completion deadline) plus
+  pre-address-validation anti-amplification — neither bounds a stalled in-progress handshake. Initial
+  packets are processed on a **shared ≤10-thread pool**, so a slow or hostile peer, or a slow trust
+  manager (e.g. a hanging CRL/OCSP fetch), can pin that shared pool (slowloris-style). **Work item:**
+  add a server-side handshake-completion deadline — generous, configurable, mirroring JGDMS P1's F2
+  handshake read-progress-deadline design and default — that aborts a connection whose handshake has
+  not completed within the window. **Also require** that certificate validation run per-connection
+  (on its own virtual thread) rather than inline on the shared pool thread, so one slow trust manager
+  cannot exhaust the pool for other connections. Both parts are an **Inc-3 acceptance criterion**.
+- **Server client-auth wiring (the SPIFFE crux).** The server port must set
+  `SSLParameters.setNeedClientAuth(true)` from the JGDMS `SSLContext`/config — agent15 had **no**
+  server-side client-cert auth, and enabling it is the whole point of this fork. The DirtyChai mTLS
+  server pos/neg test (ADVICE item D) is an **Inc-0/1 predecessor**: server mTLS is
+  present-but-untested today (§6). End-to-end trace of the SPIFFE reuse this wiring depends on:
+  `SSLContext(JGDMS AuthManager) → QuicTLSContext → engine → CertificateRequest → client
+  Certificate → server checkClientTrusted (SPIFFE-SAN match)` — this trace only **closes** once
+  DirtyChai's B1/B2/B3 land (§6); until then the server-side leg fails at `QuicTLSContext`
+  construction (B1) or at the trust-dispatch branch (B2/B3).
 
 ### 3.4 Transport-parameter seam
 
@@ -97,15 +160,40 @@ unit-testable against a mock port.
   consumer via `setRemoteQuicTransportParametersConsumer(...)`.
 - **GAP-1:** the engine has **no getter** for the peer's transport parameters (push-only). The fork
   must **cache** the consumer callback's bytes when it fires; do not expect to query them later.
+- **GAP-1 ordering barrier.** Applying the cached peer transport parameters is an **ordered
+  barrier**: no stream creation, no flow-control admission, and no CID registration may proceed
+  until the params cached from the `setRemoteQuicTransportParametersConsumer` callback have been
+  applied. The limits seeded from those params include `StreamManager.setInitialMaxStreams*`,
+  `FlowControl.updateInitialValues`, and `ConnectionIdManager`'s peer CID limit — all of them must
+  see the real peer values, never a default/zero placeholder, before anything gated by them runs.
+  **Add a negative test:** peer params delayed relative to the first application frame arriving —
+  assert deterministic handling (block/queue until params land), never silently proceeding with
+  default or zero limits in force.
 
 ### 3.5 Key-space mapping and 0-RTT exclusion
 
 - Map kwik's encryption levels to the engine `KeySpace`: `INITIAL`, `HANDSHAKE`, `ONE_RTT`, `RETRY`.
-- **No 0-RTT.** The engine refuses `ZERO_RTT` (`keysAvailable(ZERO_RTT) → false`,
-  `consumeHandshakeBytes(ZERO_RTT,…)` throws). Strip / disable early-data and the 0-RTT session-ticket
-  path on both client and server (`QuicSessionTicket.java`, `impl/QuicSessionTicketImpl.java`). The
-  port's key-space type should not even offer a `ZERO_RTT` value. (Non-0-RTT session resumption is
-  optional — decide separately; default: leave out for the first cut.)
+- **No 0-RTT — fail-closed BY CONSTRUCTION, per STD-010 §6.2 (normative MUST), not by relying on
+  engine refusal.** STD-010 §6.2 requires that the 0-RTT prohibition be enforced by the endpoint's
+  own construction, independent of whether the underlying engine implements 0-RTT. Concretely: the
+  fork **MUST assert `max_early_data_size = 0`** on the server (MUST NOT offer the `early_data`
+  extension permitting non-zero early data) and **MUST refuse early-data key spaces on both ends
+  regardless of engine support** — not merely because today's engine happens to refuse `ZERO_RTT`
+  (`keysAvailable(ZERO_RTT) → false`, `consumeHandshakeBytes(ZERO_RTT,…)` throws). A future
+  DirtyChai rebase could wire `early_data` and silently reopen the path if the fork relied on the
+  engine's current absence-of-support instead of its own explicit guard.
+- **JGDMS send-path invariant.** Independent of the above, the fork must guarantee the JERI
+  invocation envelope — user `Subject`s plus the STD-006 §7.2 ACC reducing-domain block — is
+  **never** placed in a `ZERO_RTT` key space's packets, as a positive send-path assertion. STD-010
+  §6.2 is the normative owner of this requirement; cross-reference it directly rather than
+  re-deriving the rule locally.
+- Strip / disable early-data and the 0-RTT session-ticket path on both client and server
+  (`QuicSessionTicket.java`, `impl/QuicSessionTicketImpl.java`). Keeping the port's key-space type
+  with **no `ZERO_RTT` value** remains good code hygiene (a caller can't even construct the
+  argument) but note it is **not** itself the STD's required construction-time guard — the explicit
+  `max_early_data_size = 0` assertion and the send-path invariant above are what STD-010 §6.2
+  actually requires; the enum omission is a defense-in-depth nicety on top. (Non-0-RTT session
+  resumption is optional — decide separately; default: leave out for the first cut.)
 
 ### 3.6 Module descriptor
 
@@ -113,6 +201,15 @@ unit-testable against a mock port.
   `jdk.internal.net.quic` via DirtyChai's **qualified export** (see §6) — no `requires` is needed for
   it. Keep the module name **`tech.kwik.core`** stable: DirtyChai's `module-info` names this module as
   the export target, so the two must agree.
+- **Module-name coupling diagnostic (build-time/startup assertion).** Add a startup check — a
+  `Module.canRead(...)` probe against `jdk.internal.net.quic` — that **fails loudly**, naming the
+  exact required export line, if the read is not granted. Without this, a cross-repo module-name
+  mismatch between this fork's `tech.kwik.core` and DirtyChai's `module-info` export target
+  surfaces only as an opaque `IllegalAccessError` deep in the crypto or handshake-drive seam; the
+  probe converts that into a clear, actionable diagnostic at startup. **Do not rename or split
+  `tech.kwik.core`** without a paired change to DirtyChai's `module-info` — record the exact
+  required export line as a normative cross-repo dependency:
+  `exports jdk.internal.net.quic to java.net.http, tech.kwik.core;` (see §6).
 
 ---
 
@@ -132,23 +229,93 @@ unit-testable against a mock port.
 
 | Inc | Deliverable |
 |---|---|
-| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`. |
+| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 + mTLS-server pos/neg test (ADVICE item D) land as a **predecessor gate**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) lands clean. |
 | 1 | INITIAL+HANDSHAKE handshake completes client↔server over loopback; engine does AEAD; `getSession().getPeerCertificates()` populated both ends. |
-| 2 | ONE_RTT application data; streams carry payload end-to-end. |
-| 3 | Server accept loop with **client-auth required**; SPIFFE/X.500 positive **and** negative (wrong/absent identity → rejected). |
-| 4 | Interop against ≥1 other QUIC implementation (JDK HTTP/3 client and/or upstream kwik); Retry + Version-Negotiation paths. |
+| 2 | ONE_RTT application data; streams carry payload end-to-end; `setOneRttContext` wired (§3.3). |
+| **H** | **Adversarial-input hardening pass on the kept transport** (new — before Inc 3 mTLS; see §7.3a): fuzz harness + line-by-line audit sign-off of the nine kept transport packages; anti-amplification / Retry / stateless-reset re-verification (server/impl driver rewrite). |
+| 3 | Server accept loop with **client-auth required** (`SSLParameters.setNeedClientAuth(true)`); SPIFFE/X.500 positive **and** negative (wrong/absent identity → rejected); server handshake-completion deadline in force (§3.3 DoS item); anti-amplification re-verified. |
+| 4 | Interop against ≥1 other QUIC implementation (JDK HTTP/3 client and/or upstream kwik); Retry + Version-Negotiation paths (`restartHandshake`, §3.3). |
 
 ---
 
 ## 6. Runtime, dependency, and DirtyChai coupling
 
-- **DirtyChai side (settled; humans implement per DirtyChai's advise-only policy):** trust-dispatch
-  relaxation **B1** (`SSLContextImpl.isUsableWithQuic()` accepts any `X509ExtendedTrustManager`),
-  **B2** (QUIC trust dispatch routes custom managers through the standard 3-arg `SSLEngine`-adapter),
-  **B3** (server-block fail-secure final `else`) — all done — plus **one line** in DirtyChai's
-  `module-info.java`: add `tech.kwik.core` to `exports jdk.internal.net.quic to java.net.http;`. No
-  driver facade is built; the fork compiles against `jdk.internal.net.quic.QuicTLSEngine` directly and
-  versions in lockstep with DirtyChai.
+### 6.1 DirtyChai side — B1/B2/B3: REQUIRED, NOT DONE (critical correction)
+
+**Prior text in this SOW stated B1/B2/B3 were "all done." That was FALSE against current DirtyChai
+trunk and is corrected here.** Verified current state:
+
+- **B1 — NOT done.** `SSLContextImpl.isUsableWithQuic()` still returns
+  `trustManager instanceof X509TrustManagerImpl`. JGDMS's `AuthManager` is wrapped, on
+  `SSLContext.init()`, as an `X509ExtendedTrustManager` — **not** an `X509TrustManagerImpl` — so it
+  fails this gate. The failure occurs at `QuicTLSContext` **construction**: the engine cannot even
+  be built from a JGDMS `SSLContext` today.
+- **B2 — NOT done.** `CertificateMessage`'s QUIC trust-dispatch branch still throws
+  `"QUIC only supports SunJSSE trust managers"` for any manager that isn't `X509TrustManagerImpl`.
+  No `SSLEngine`-adapter branch exists yet to route a custom `X509ExtendedTrustManager` through the
+  standard 3-arg dispatch.
+- **B3 — NOT done, and it is fail-OPEN.** The server-side client-cert validation block has **no
+  final `else`** after the `QuicTLSEngineImpl` branch: an unrecognized transport falls straight
+  through to `setPeerCertificates` with **no validation performed**, admitting the client cert
+  **unvalidated**. The client-side block has the fail-secure `else throw new
+  AssertionError("Unexpected transport type")` pattern; the server-side block does not.
+
+**Consequence:** none of B1, B2, or B3 exist in DirtyChai trunk today. This SOW's Inc 0 therefore
+has an **explicit predecessor gate**: *DirtyChai lands B1 + B2 + B3 + the mTLS-server pos/neg test
+(ADVICE item D)* before this fork's server-mTLS work (Inc 3) can be validated end-to-end, and
+before Inc 0 can be called complete. **Named owner:** a human DirtyChai maintainer (DirtyChai is
+advise-only for AI; humans write the fix per its `CLAUDE.md` policy) — this SOW cannot assign or
+schedule that work, only depend on it. **This is the schedule's critical-path risk**: it is a
+cross-repo dependency on advise-only human effort in a repo this SOW's author does not control the
+pace of. Track it explicitly; do not assume it lands on this fork's timeline (see §7.2).
+
+### 6.2 Architecture decision (ratified 2026-07-06) — direct `jdk.internal.net.quic` + `QuicTlsPort`, facade override acknowledged
+
+Peter has **ratified** keeping the **direct** dependency on `jdk.internal.net.quic` plus the
+in-fork `QuicTlsPort` (§3.1), **overriding** the "facade-for-production" recommendation in
+`ADVICE-quic-tls-dirtychai-locations-2026-07-05.md` (item C) and its detailed design in
+`ADVICE-quic-facade-interface-2026-07-05.md`. This is recorded here as an **acknowledged override**,
+not a silent contradiction of the ADVICE series — the ADVICE documents remain correct analysis of
+the facade option; this SOW documents why the team chose not to take it.
+
+**Rationale:**
+- **(a) Hand-maintenance cost falls on the hardest-to-change repo.** A facade would have to be
+  human-written in the advise-only DirtyChai repo: ~21 methods (per the ADVICE §3 enumeration) + 2
+  re-declared enums (`KeySpace`, `HandshakeState`) + 2 facade-level exception types + a
+  transport-parameters consumer interface + a factory + tests — a large hand-maintained surface
+  landing on the one repo where AI cannot help write it and humans are the bottleneck.
+- **(b) A facade relocates the coupling, it does not remove it.** The internal-type dependency
+  still exists on the far side of the facade (DirtyChai itself still names `QuicVersion`,
+  `QuicTransportException`, etc.) — it moves the coupling from this fork to DirtyChai, it does not
+  eliminate it from the system.
+- **(c) Direct dependency is acceptable here specifically because of lockstep ownership.**
+  Depending on `jdk.internal` types is normally the thing to avoid — but here DirtyChai is the
+  **sole runtime** this fork targets, and the team owns **both ends** of the version pin (fork and
+  runtime), so the two can be versioned in lockstep rather than needing an abstraction boundary
+  against an externally-changing dependency.
+- **(d) `QuicTlsPort` already gives fork-side isolation.** The §3.1 port gives this fork's own code
+  isolation from `jdk.internal.net.quic` types (all re-pointed code talks to the port, not the raw
+  engine) and mock-testability, which was the practical benefit a facade would have offered to this
+  side of the boundary anyway.
+
+**Honest caveat — the port CONFINES, it does not SEVER, the internal-type dependency.** The port's
+own method signatures still name `jdk.internal.net.quic` types directly — `QuicVersion`,
+`QuicTransportException`, etc. appear in `QuicTlsPort`'s own contract, not just inside its
+implementation. So upgrade coupling to the JEP-517-fresh internal API (§7.3 standing risk) is a
+**retained risk, mitigated by lockstep versioning — not neutralized** by the port. Accordingly:
+the earlier framing of "equivalent isolation" (as if the port matched what a facade would give) and
+"single-file swap" (as if converting to a future public API were a one-line change even with
+internal types in the port's own signatures) are **overclaims** and are softened here: the port
+gives real fork-side isolation and testability (point d above), but it is not a severance of the
+internal-API dependency, and a future conversion to a public QUIC-TLS API will need to touch the
+port's own signatures, not just its implementation.
+
+### 6.3 Export line and SPI surface
+
+- DirtyChai side, once B1/B2/B3 land (§6.1): **one line** in DirtyChai's `module-info.java` — add
+  `tech.kwik.core` to `exports jdk.internal.net.quic to java.net.http;`. No driver facade is built
+  (§6.2); the fork compiles against `jdk.internal.net.quic.QuicTLSEngine` directly and versions in
+  lockstep with DirtyChai.
 - **Every type on the engine's SPI signatures lives in `jdk.internal.net.quic`** (verified:
   `QuicVersion`, `QuicTransportException`, `QuicKeyUnavailableException`, `QuicOneRttContext`,
   `QuicTransportParametersConsumer`, `QuicTLSContext`), so the single qualified export covers the whole
@@ -156,6 +323,17 @@ unit-testable against a mock port.
 - **Stock-JDK caveat:** even with the engine exported, a stock OpenJDK rejects custom (non-SunJSSE)
   trust managers at `isUsableWithQuic`; only DirtyChai's B1/B2/B3 admits JGDMS's SPIFFE `AuthManager`.
   Hence DirtyChai-only, like JGDMS.
+
+### 6.4 Algorithm-constraint re-imposition (inherited dependency)
+
+JGDMS re-imposes TLS algorithm constraints in its own trust evaluation — Peter's ratified decision
+(`ADVICE-quic-tls-dirtychai-locations-2026-07-05.md` §6): the JSSE-layer 3-arg adapter path carries
+algorithm constraints too (belt-and-braces), but JGDMS's own re-imposition is **not contingent** on
+that adapter and remains required regardless. This fork **inherits** that dependency unchanged: the
+same `AuthManager` is reused for QUIC as for the existing TCP/TLS transport, so record here that the
+algorithm-constraint re-imposition must not be dropped when the trust path is re-driven through
+QUIC — it is a JGDMS-side obligation this fork's server client-auth wiring (§3.3) relies on staying
+in place.
 
 ---
 
@@ -184,6 +362,22 @@ coupling meets the transport at ~3 transition points only. `tlsEngine.add(...)` 
 (`QuicClientConnectionImpl.java:206`) + one injected server factory (`ServerConnectionImpl.java:142`),
 both → build an `SSLContext` and `createEngine()`.
 
+**Scope correction — this "clean rewrite" finding covers the handshake-DRIVER callback seam only,
+not the crypto seam.** The analysis above verifies the callback/message-dispatch seam is clean
+(delete-dominant, not deeply entangled) — that finding stands. It does **not** extend to the
+crypto/AEAD/key-lifecycle seam (§3.2), which is a genuine re-architecture: kwik's two-step
+protect/unprotect model vs. the engine's fused `encryptPacket`/`decryptPacket` calls is an
+impedance mismatch the driver-seam analysis doesn't touch, and the key-update ratchet relocation
+(§3.2) is a distinct correctness-sensitive deletion. "No structural entanglement to fight" (below,
+§7.2) describes the driver seam; the crypto seam carries its own, separate risk.
+
+**Week-1 spike (Inc 0/1).** Before committing to the full crypto-seam rewrite, drive **one INITIAL
+packet** end-to-end through the engine's `encryptPacket`/`decryptPacket` (encrypt on one side,
+decrypt on the other, against real engine instances) to prove the fused-vs-split reconciliation
+works on the real path — not just on paper — before the rest of §3.2's work is scheduled against
+it. Treat this spike as a gate: if it doesn't land clean, the crypto-seam estimate (§7.2) needs
+re-scoping before proceeding.
+
 ### 7.2 Estimate — ≈ 6–8 weeks to green bidirectional mTLS + basic interop
 
 One developer comfortable with QUIC/TLS, after ramp:
@@ -202,19 +396,90 @@ Risk is concentrated in the middle ~2–3 weeks (crypto + driver seam). **Mitiga
 end:** the JDK engine's pull state machine is documented and already has a reference driver — the JDK's
 own HTTP/3 client drives the identical engine. **What could push it to 2–3 months:** interop /
 loss-recovery interactions with the re-pointed key-space transitions surfacing subtle handshake bugs
-(handshakes are iterative), or a config setter with no clean `SSLParameters` equivalent. No structural
-entanglement to fight — the residual risk is iteration, not architecture. Estimate covers the transport
-fork only (excludes the DirtyChai one-line export and the JGDMS `Endpoint`/`ServerEndpoint` SPI on top),
-and assumes QUIC/TLS familiarity — add ramp time otherwise.
+(handshakes are iterative), or a config setter with no clean `SSLParameters` equivalent — plus the
+crypto-seam re-architecture and key-update relocation (§3.2), which carry their own risk beyond the
+driver seam's (see §7.1 scope correction). Estimate covers the transport fork only (excludes the
+DirtyChai one-line export and the JGDMS `Endpoint`/`ServerEndpoint` SPI on top), and assumes QUIC/TLS
+familiarity — add ramp time otherwise.
+
+### 7.2a Estimate correction — 6–8 weeks is a happy-path FLOOR; honest estimate is 8–12 weeks
+
+The table above is a **floor**, not the estimate to plan against. Correcting it: **8–12 weeks**,
+driven by three items the 6–8-week table above under-weights or omits —
+
+- the crypto-seam **re-architecture** (§3.2: fused-vs-split reconciliation across `QuicPacket` and
+  both packet parsers, not the "delete and delegate" framing the floor estimate assumed),
+- **key-update relocation** (§3.2 KEY-UPDATE item: deleting `KeyUpdateSupport` +
+  `ShortHeaderPacket`'s key-phase logic and reconciling with the engine's ratchet) — **≈ +5 d** on
+  top of the floor table's crypto-seam line,
+- the **untrusted-transport hardening pass** (new increment, §7.3a) — **1–2 weeks**, not present in
+  the 6–8-week table at all.
+
+This 8–12-week estimate is **conditional on the week-1 crypto-seam spike (§7.1) landing clean** —
+if the spike surfaces a harder reconciliation than expected, re-scope before committing further.
+
+**Explicitly EXCLUDED from this estimate** (both were already out of scope for the 6–8-week floor,
+restated here so the correction doesn't get read as absorbing them):
+- the **human DirtyChai B1/B2/B3 + mTLS-test critical path** (§6.1) — a separate repo, on
+  advise-only human effort this SOW does not control the pace of;
+- the **JGDMS `Endpoint`/`ServerEndpoint` SPI + STD-010 conformance work layered on top** —
+  server-initiated streams, DGC in-band ack, execution-subject swap.
+
+**State plainly:** 6–8 weeks (the floor) or 8–12 weeks (the honest estimate) both yield an
+**mTLS-authenticated QUIC byte pipe** — a **prerequisite**, not the JERI transport itself. The
+`Endpoint`/`ServerEndpoint` SPI and STD-010 conformance work is a separate, subsequent effort.
 
 ### 7.3 Standing risks
 
 - **Engine API instability:** `jdk.internal.net.quic` is JEP-517-fresh internal API. Mitigated by the
-  §3.1 isolation port + DirtyChai lockstep; converts to the OpenJDK public API when published.
-- **Upstream drift:** the untouched transport packages merge cleanly from `upstream`; divergence is
-  confined to the TLS seam. Merge upstream transport/security fixes periodically.
+  §3.1 isolation port + DirtyChai lockstep; converts to the OpenJDK public API when published. Per
+  §6.2, the port confines but does not sever this dependency — the port's own signatures still name
+  internal types, so a future conversion touches the port's contract too, not just its
+  implementation.
+- **Upstream drift / merge conflicts.** The untouched transport packages merge cleanly from
+  `upstream`. However, the **~15 agent15-touching seam files are expected to CONFLICT** on upstream
+  merge and need manual reconciliation — only the transport core merges cleanly, not the TLS seam.
+  Consider isolating the rewritten seam into as few files as possible (the §3.1 port already helps
+  by concentrating the re-pointed code behind one interface) to shrink the conflict surface. Merge
+  upstream transport/security fixes periodically (standing §7.3a task, below).
 - **License:** LGPLv3 obligations travel with the fork; keep it out of GPLv2 `java.base` (it lives in
   JGDMS userspace).
+- **NOTICE file — Inc-0 deliverable.** The header promises a NOTICE file crediting Peter Doornbosch
+  and marking this a derivative work; it is not yet present. Treat it as an explicit **Inc-0**
+  deliverable, not an implied housekeeping task to get to eventually.
+
+### 7.3a Adversarial-input hardening pass on the kept transport (new increment, before Inc 3 mTLS)
+
+The transport packages kept "as-is" (§2) are untouched by the TLS re-pointing, but they are not
+therefore validated against an adversarial/untrusted peer — that is a distinct question this SOW
+had not previously scoped. Add an explicit increment, scheduled **before Inc 3's client-auth work**
+(see §5 Inc **H**):
+
+- **(a) Structured fuzz harness** over `PacketParser.parseAndProcessPackets` and
+  `QuicPacket.parseFrames`, run on the DirtyChai JDK: malformed frames, oversized varints,
+  overlapping/duplicate stream frames, adversarial ACK ranges, spoofed CID frames. Highest-value
+  target: `ReceiveBufferImpl`'s overlap arithmetic (`shrinkFrame`/`combine`).
+- **(b) Written line-by-line audit sign-off** of the nine kept packages (`ack`, `cc`, `cid`,
+  `frame`, `packet`, `recovery`, `send`, `receive`, `stream`) against a threat model, filed in the
+  style of STD-010's `AUDIT-1..N` list.
+- **(c) Standing task:** merge upstream security fixes into the kept transport packages on an
+  ongoing basis (folds into the merge-drift mitigation above).
+
+**This is a required AUDIT/proof, not a rewrite.** The parsers were spot-verified to fail closed
+with real DoS defenses already in place — flow control, stream-count limits, a reassembly
+memory-amplification bound, and bounded CIDs — so the hardening pass's job is to prove that
+holds under adversarial input and document it, not to redesign the transport. **Budget 1–2 weeks**
+(additive to the 6–8-week floor; already folded into the 8–12-week corrected estimate, §7.2a).
+
+### 7.3b Anti-amplification re-verification (§3.3 / Inc 4 checkpoint)
+
+The 3× anti-amplification limit, Retry/address-validation, and stateless-reset paths live in
+`server/impl`, which **imports agent15 and is re-pointed** by this SOW's driver-seam work (§3.3) —
+they are **not** covered by the "transport kept as-is" reassurance (§2), because `server/impl` is
+explicitly part of the re-pointed set, not the kept set. Re-verify all three paths after the
+server-package driver rewrite lands, and add a **spoofed-source-address amplification test** as
+part of that re-verification. Make this an explicit checkpoint gating Inc 4 (interop/Retry/
+Version-Negotiation), not an assumption carried over from the kept-transport list.
 
 ---
 
