@@ -62,6 +62,38 @@ Define **one** internal interface in the fork — e.g. `tech.kwik.core.tls.QuicT
 (JEP 517 flags this as future work), conversion is a single-file swap, and the transport becomes
 unit-testable against a mock port.
 
+**Gradle toolchain wiring — landed 2026-07-19 (commit `97abfce1`, branch
+`build/quic-tls-port-gradle-toolchain-v2`).** The already-merged `QuicTlsPort`/`QuicTlsPortImpl`
+production code and both test suites (`QuicTlsPortMockTestabilityTest`,
+`QuicTlsPortImplRealEngineTest`) were, until now, only verified by hand-invoking `javac`/`java`
+directly against the DirtyChai image. `core/build.gradle` now pins a real Gradle toolchain
+(`languageVersion = 27`) resolved via `gradle.properties`' `org.gradle.java.installations.paths`
+(gitignored — machine-local, each dev/CI box needs its own copy pointing at its own DirtyChai
+build) so `./gradlew --offline --no-daemon clean :kwik:test --tests "tech.kwik.core.tls.*"` builds
+and runs both suites for real — 31/31 green.
+
+Empirical finding along the way, relevant to any future work near `jdk.internal.net.quic`:
+javac's `--release N` cross-compilation mode cannot see `jdk.internal.net.quic` **at any release
+value, including 27** (DirtyChai's own version, not just a lower one). `--release` compiles
+against `ct.sym` stub API data for that release rather than the real `jrt` image, and `ct.sym`
+does not carry DirtyChai's qualified-export patch (`qualified exports jdk.internal.net.quic to
+java.net.http tech.kwik.core`, confirmed via `java --describe-module java.base`). So `core`'s
+`JavaCompile` tasks force `options.release` back to `null` after configuring the toolchain — this
+is now a hard constraint on how `core` may ever be compiled, not just a convenience setting.
+
+This is a first step toward §3.6, not §3.6 itself: `module-info.java` is untouched (still no
+`requires tech.kwik.agent15` removal, still no `requires jdk.internal.net.quic` — correctly, since
+the qualified export doesn't need one), and agent15 wiring is untouched. **Known gap, left
+deliberately unfixed:** bumping only `core` to language level 27 breaks Gradle's variant-aware
+dependency resolution for `qlog`/`interop`/`cli`/`samples`/`h09`, all of which depend on
+`project(':kwik')` — a whole-reactor `./gradlew build` (what CI runs) now fails at those five
+dependency edges ("looking for a library compatible with JVM runtime version 11, but 'project
+:kwik' is only compatible with JVM runtime version 27 or newer"), even though `:kwik:compileJava`
+and `:kwik:test` are green in isolation. Fixing that reactor-wide break would mean touching those
+five subprojects' build files, which this task scoped out ("only core should need to change") —
+left as an open follow-up decision (bump them too, or call `java.disableAutoTargetJvm()`) for
+whoever picks up §3.6 in earnest.
+
 ### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's split calls
 
 **This is a re-architecture of `packet` + both packet parsers, not a deletion.** kwik and the
