@@ -62,18 +62,21 @@ Define **one** internal interface in the fork — e.g. `tech.kwik.core.tls.QuicT
 (JEP 517 flags this as future work), conversion is a single-file swap, and the transport becomes
 unit-testable against a mock port.
 
-### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's fused calls
+### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's split calls
 
 **This is a re-architecture of `packet` + both packet parsers, not a deletion.** kwik and the
 engine protect packets under **different shapes**: kwik's `QuicPacket` performs protection in
 **two caller-driven steps** — payload `aeadEncrypt` (kwik computes the nonce and does the AEAD
 call itself against secrets it derived) plus a separate `createHeaderProtectionMask` (kwik samples
-the ciphertext and XORs the mask into the header itself) — whereas the engine offers a **single
-fused call** per direction: `encryptPacket(...)` / `decryptPacket(...)` do nonce handling, AEAD,
-*and* header-protection sampling/masking in one call (`computeHeaderProtectionMask` is also
-available standalone where the fused call isn't the fit). Reconciling kwik's two-step model with
-the engine's fused model is a rewrite of `QuicPacket` and both packet parsers — the call sites
-change shape, not just their source of keys.
+the ciphertext and XORs the mask into the header itself) — whereas the engine also splits
+protection into **two mandatory calls per direction**: `computeHeaderProtectionMask(...)` (header-
+protection sampling/masking) must be called separately from `encryptPacket(...)` /
+`decryptPacket(...)` (nonce handling + AEAD only — header protection is not fused into either
+call; the engine's own `decryptPacket` javadoc requires protection removed from the header before
+the call). `computeHeaderProtectionMask` is not an optional fallback for cases a fused call
+doesn't fit — there is no fused call; it is mandatory on both directions, for every packet.
+Reconciling kwik's two-step model with the engine's two-step model is a rewrite of `QuicPacket`
+and both packet parsers — the call sites change shape, not just their source of keys.
 
 - **Files:** `core/.../crypto/ConnectionSecrets.java`, `core/.../crypto/CryptoStream.java`,
   `core/.../packet/QuicPacket.java` (+ both packet parsers — see §2 caveat).
@@ -81,7 +84,7 @@ change shape, not just their source of keys.
   derives its own AEAD keys via HKDF, and builds its own `Aes128Gcm` / `Aes256Gcm` /
   `ChaCha20Poly1305` ciphers, then calls its own two-step protect/unprotect from `QuicPacket`.
 - **Change:** delete the key-derivation and AEAD construction in `ConnectionSecrets`; re-point
-  `QuicPacket`'s two-step call sites onto the engine's fused calls via the port: `encryptPacket` /
+  `QuicPacket`'s two-step call sites onto the engine's split calls via the port: `encryptPacket` /
   `decryptPacket` / `computeHeaderProtectionMask` / `getHeaderProtectionSampleSize` /
   `getAuthTagSize` / `deriveInitialKeys` / `keysAvailable` / `discardKeys`. **Raw secrets are never
   requested** — this is the security point of the fork.
@@ -239,7 +242,7 @@ change shape, not just their source of keys.
 
 | Inc | Deliverable |
 |---|---|
-| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 landed (trunk `98bcc58115f`, §6.1); the mTLS-server pos/neg test (ADVICE item D) remains a **predecessor**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) lands clean. |
+| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 landed (trunk `98bcc58115f`, §6.1); the mTLS-server pos/neg test (ADVICE item D) remains a **predecessor**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) landed clean 2026-07-19 (commit `994aea8a`). |
 | 1 | INITIAL+HANDSHAKE handshake completes client↔server over loopback; engine does AEAD; `getSession().getPeerCertificates()` populated both ends. |
 | 2 | ONE_RTT application data; streams carry payload end-to-end; `setOneRttContext` wired (§3.3). |
 | **H** | **Adversarial-input hardening pass on the kept transport** (new — before Inc 3 mTLS; see §7.3a): fuzz harness + line-by-line audit sign-off of the nine kept transport packages; anti-amplification / Retry / stateless-reset re-verification (server/impl driver rewrite). |
@@ -385,12 +388,25 @@ impedance mismatch the driver-seam analysis doesn't touch, and the key-update ra
 (§3.2) is a distinct correctness-sensitive deletion. "No structural entanglement to fight" (below,
 §7.2) describes the driver seam; the crypto seam carries its own, separate risk.
 
-**Week-1 spike (Inc 0/1).** Before committing to the full crypto-seam rewrite, drive **one INITIAL
-packet** end-to-end through the engine's `encryptPacket`/`decryptPacket` (encrypt on one side,
-decrypt on the other, against real engine instances) to prove the fused-vs-split reconciliation
-works on the real path — not just on paper — before the rest of §3.2's work is scheduled against
-it. Treat this spike as a gate: if it doesn't land clean, the crypto-seam estimate (§7.2) needs
-re-scoping before proceeding.
+**Week-1 spike (Inc 0/1) — empirically confirmed 2026-07-19 (commit `994aea8a`, branch
+`spike/quic-tls-crypto-seam-week1`).** Drove one INITIAL packet round trip through two real
+`QuicTLSEngine` instances (client encrypt, server decrypt) — not just on paper — with negative-path
+verification: a flipped ciphertext byte and a flipped header/AAD byte both correctly threw
+`AEADBadTagException`. **Result: PASSED.**
+
+Two findings came out of it. (1) Header protection is **not** fused into
+`encryptPacket`/`decryptPacket` — `computeHeaderProtectionMask` is a separate, mandatory call on
+both directions, for every packet, not an optional fallback for cases a fused call doesn't fit;
+see the §3.2 correction above. This does not change the order of magnitude of the crypto-seam
+estimate (§7.2/§7.2a) — it corrects the API description, not a new risk. (2) INITIAL keys are
+available with zero handshake state: `deriveInitialKeys()` succeeded on a bare, freshly-constructed
+engine with no `SSLParameters`, no `versionNegotiated`, no transport-params wiring —
+`keysAvailable(INITIAL)` returned `true` immediately, no CRYPTO bytes exchanged. Confirms the
+transport can start feeding the engine INITIAL-space crypto as soon as it has the peer's connection
+ID, independent of and prior to any handshake-driver wiring (§3.3). Tested at one CID length (8
+bytes) only — a promising, not fully exhaustive, data point.
+
+Gate cleared: the crypto-seam rewrite (§3.2) proceeds as scoped.
 
 ### 7.2 Estimate — ≈ 6–8 weeks to green bidirectional mTLS + basic interop
 
