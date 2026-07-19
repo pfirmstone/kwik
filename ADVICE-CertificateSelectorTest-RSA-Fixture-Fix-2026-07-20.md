@@ -1,6 +1,11 @@
 # ADVICE: Regenerate weak RSA test fixtures in `TestCertificates.java`
 
-Status: **SCOPE ONLY — not implemented.** This document plans a fix; it does not apply one.
+Status: **IMPLEMENTED.** Implemented on branch `fix/certselector-rsa-2048-fixtures`
+(commit `b398c148`, in an isolated `git worktree` sibling of this repo checkout — this
+document itself was amended in a follow-up commit on the same branch). A 3-reviewer board
+approved this document's core approach ahead of implementation and found four corrections,
+folded into the sections below (§4's script, §5's reasoning, §4's verification note, and
+§7 open question 6) — see the "Board corrections" callouts inline.
 
 ## 1. Background (established, not re-derived here)
 
@@ -158,10 +163,15 @@ openssl genrsa -out ee1.key 2048
 openssl req -key ee1.key -new -out ee1-cert.csr -subj='/CN=endentity1'
 openssl x509 -req -in ee1-cert.csr -CAkey ca1.key -CA ca1-cert.pem -out ee1-cert.pem -days 3650 -CAcreateserial
 
-# Sub-CA, signed by CA1 (reuse ca1.srl from above so serials don't collide)
+# Sub-CA, signed by CA1 (reuse the serial file from CA1's -CAcreateserial step above so
+# serials don't collide -- BOARD CORRECTION: -CAcreateserial names the serial file after the
+# -CA argument's *basename*, i.e. "ca1-cert.srl" for -CA ca1-cert.pem, NOT "ca1.srl" as the
+# original draft of this doc said (that filename is never produced by any prior step and
+# -CAserial ca1.srl would fail with "unable to load 'ca1.srl'"). Verified by running the
+# actual commands: the EE1 step above produces ca1-cert.srl, and that is the file to pass here.
 openssl genrsa -out subca1.key 2048
 openssl req -key subca1.key -new -out subca1-cert.csr -subj='/CN=SubCA'
-openssl x509 -req -in subca1-cert.csr -CAkey ca1.key -CA ca1-cert.pem -out subca1-cert.pem -days 3650 -CAserial ca1.srl
+openssl x509 -req -in subca1-cert.csr -CAkey ca1.key -CA ca1-cert.pem -out subca1-cert.pem -days 3650 -CAserial ca1-cert.srl
 
 # End-entity 2, signed by CA2
 openssl genrsa -out ee2.key 2048
@@ -185,8 +195,11 @@ openssl x509 -in ee1-cert.pem -outform der | base64 -w0
 openssl pkcs8 -topk8 -inform PEM -in ee1.key -outform DER -nocrypt | base64 -w0
 ```
 
-Re-wrap the base64 output to match the file's existing ~68-char-per-line Java string-literal
-style for a clean diff (cosmetic, not required for correctness).
+Re-wrap the base64 output to match the file's existing Java string-literal wrapping style for a
+clean diff (cosmetic, not required for correctness). **Correction on implementation**: the
+file's actual existing wrap width, measured directly off the pre-change constants, is 64
+base64 characters per quoted line (not ~68 as originally estimated here) — the implementation
+wraps at 64 to match exactly.
 
 **Verification before considering the change done** (this belongs in the implementation step,
 not this scope doc, but recording it here so the plan is concrete): after editing, decode every
@@ -194,6 +207,21 @@ new constant back out (`openssl x509 -text` / `openssl rsa -text`) and confirm (
 (b) each Subject/Issuer DN matches §3's list exactly, (c) chain-of-trust verifies
 (`openssl verify -CAfile ca1-cert.pem ee1-cert.pem` etc.), *then* run
 `CertificateSelectorTest` under both a stock JDK and DirtyChai and confirm all 6 pass on both.
+
+**BOARD CORRECTION — expected verification failure, do not chase it**: step (c) above verifies
+cleanly for CA1→EE1 and CA2→EE2 (both single-hop, root-signs-leaf directly). It does **not**
+verify cleanly for the SubCA→EE1_1 hop: `openssl verify -CAfile <ca1+subca1 chain> ee1_1-cert.pem`
+fails with `error 79 at 1 depth lookup: invalid CA certificate`, because the SubCA certificate
+(item #3 in §2.2) carries no `Basic Constraints CA:TRUE` extension, so OpenSSL's PKIX path
+validator refuses to treat it as a valid intermediate CA. This is **pre-existing, not introduced
+by this regeneration** — the 512-bit SubCA cert being replaced already lacked that extension
+(confirmed by inspecting it before regenerating), and adding it now would be unrequested scope
+expansion beyond a key-size bump, so it was deliberately left as-is. It is also functionally
+harmless for the actual fix: DirtyChai's `X509KeyManagerCertChecking` does per-certificate
+algorithm-constraint checking (the thing this whole fix is about), not full PKIX chain-path
+validation, so `CertificateSelectorTest` is unaffected by this gap — confirmed by all 6 tests
+passing. Treat this one `openssl verify` failure on this one hop as expected; verify the other
+two chains (CA1→EE1, CA2→EE2) cleanly instead.
 
 ## 5. Blast radius
 
@@ -211,6 +239,20 @@ carries no risk. No other file in `core/src/test` or elsewhere in the reactor re
 methods in `CertificateSelectorTest.java`, all of which are self-contained (in-memory `KeyStore`
 built fresh per test, no shared static state, no external files) — regenerating the fixtures
 cannot silently break anything currently passing outside this one file.**
+
+**BOARD CORRECTION (reasoning, not conclusion)**: the paragraph above is right that nothing
+*currently* consumes `TestCertificates` outside `CertificateSelectorTest`, but it understates
+how it's reachable. `qlog/build.gradle` has
+`testImplementation(project(':kwik').sourceSets.test.output)`, which puts the whole `core`
+test-source output — including `TestCertificates` — on `qlog`'s test classpath. So the correct
+statement is not "no path exists from `qlog` to `TestCertificates`" (structurally isolated); it's
+"a path exists, but was checked and confirmed to have no consumer" — a grep across
+`qlog/src/test` for `TestCertificates` (and for any other reference to `tech.kwik.core.test` or
+`tech.kwik.core.client.CertificateSelector*`) turns up nothing. The conclusion (safe to
+regenerate, blast radius contained to `CertificateSelectorTest.java`) is unchanged; only the
+justification is corrected here, since "no path exists" and "path exists but is unused" are
+different claims and the latter is what's actually true, and is what was re-verified before
+implementing.
 
 Worth noting for completeness (not a reason to change scope): tests
 `whenNoCertIssuerDnMatchesNoCertShouldBeSelected`, `endEntitySignedByUnknownSubcaShouldNotBeSelected`,
@@ -268,3 +310,47 @@ re-verify.
    weakness rather than genuine correctness (§5) — worth a separate follow-up ticket to tighten
    those assertions so they'd actually catch a regression, but explicitly out of scope for this
    fix.
+
+   **BOARD CORRECTION (factual, not scope)**: only 2 of the 3 pass for the "weak assertion"
+   reason described above — `whenNoCertIssuerDnMatchesNoCertShouldBeSelected` and
+   `endEntitySignedByUnknownSubcaShouldNotBeSelected`, both of which assert a null/no-match
+   outcome that's satisfied whether or not DirtyChai's filtering actually fires. The third,
+   `whenNoCertificateMatchesFallbackIsUsed`, passes for a *different* reason: its fallback path
+   calls `keyManager.getClientAliases("RSA", null)`, a genuinely different
+   `X509ExtendedKeyManager` method from `chooseEngineClientAlias()` (the one
+   `X509KeyManagerCertChecking` patches) — DirtyChai's hardening simply doesn't touch that method,
+   so this test isn't a weak-assertion case at all, it exercises an unpatched code path. Doesn't
+   change the recommendation (still a candidate for a follow-up ticket, still out of scope here),
+   just corrects which 2 of the 3 are "weak assertion" versus which 1 is "different method
+   entirely."
+
+## 8. Implementation record
+
+Implemented on `fix/certselector-rsa-2048-fixtures`, commit `b398c148` (fixture regeneration),
+in an isolated `git worktree` off `master` at `ba9615c5`. Followed §4's plan with the `-CAserial
+ca1-cert.srl` fix from board finding #2, and left the extension-less SubCA cert as-is per board
+finding #3. All 6 RSA keypairs regenerated (CA1, CA2, SubCA1, EE1, EE2, EE1_1); EC fixture
+(`encodedEcEndEntityCertificate`/`encodedEcEndEntityCertificatePrivateKey`) confirmed
+byte-identical before/after via `git diff`.
+
+Verification performed:
+- Decoded all 12 new base64-DER constants directly out of the edited Java source (not just the
+  scratch `openssl` output) and confirmed 2048-bit RSA and exact Subject/Issuer DN match against
+  §2.2/§3 for every cert; confirmed each key's RSA modulus matches its paired cert's modulus.
+- `openssl verify` clean for CA1→EE1 and CA2→EE2; SubCA→EE1_1 fails with the expected, pre-existing
+  `error 79` (see §4 board-correction note above) — reproduced against the pasted constants, not
+  just the scratch files.
+- `./gradlew --offline --no-daemon :kwik:test --tests "tech.kwik.core.client.CertificateSelectorTest"`
+  under the DirtyChai JDK 27 toolchain: **6/6 tests pass**, including both previously-failing
+  tests (`whenCertIssuerDnMatchesCertShouldBeSelected`,
+  `endEntitySignedBySubcaWithCaMatchingShouldBeSelected`) and all 4 that were already passing.
+- Same test class recompiled from source (classpath mode, `--release 21`, module-info excluded
+  since gradle's build pins a JDK-27-only toolchain that stock JDKs can't satisfy) and run via
+  the JUnit Platform Launcher API under both stock OpenJDK 21 and stock OpenJDK 25: **6/6 pass on
+  both**, confirming no regression on non-DirtyChai JDKs.
+- Broader `./gradlew --offline --no-daemon :kwik:test` (whole `core` module, 990 tests): 989
+  pass, 1 skip (`ServerConnectorImplTest.afterCloseNoAdditionalThreadsShouldBePresent`,
+  pre-existing and unrelated to this change), 0 failures.
+
+This document was amended to IMPLEMENTED status, with the board corrections folded in, in a
+follow-up commit on the same branch.
