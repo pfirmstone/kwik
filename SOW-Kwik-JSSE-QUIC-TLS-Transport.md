@@ -327,6 +327,18 @@ gives real fork-side isolation and testability (point d above), but it is not a 
 internal-API dependency, and a future conversion to a public QUIC-TLS API will need to touch the
 port's own signatures, not just its implementation.
 
+**Concrete instance — the confinement is a build/toolchain constraint on testing, not just an
+upgrade-coupling risk.** Confirmed 2026-07-19 during §3.1 implementation: stock OpenJDK 25.0.3 does
+not merely fail to *export* `jdk.internal.net.quic` — the package does not exist there at all
+(`javac`: "package jdk.internal.net.quic does not exist", a compile-time absence, not an
+access-control denial). Because `QuicTlsPort`'s own signatures name real `jdk.internal.net.quic`
+types (point (d) above), even a hand-written mock/stub implementation (`FakeQuicTlsPort`,
+`core/src/test/java/tech/kwik/core/tls/`) cannot be *compiled* outside a JDK that ships that
+package — DirtyChai, or a future OpenJDK on the same JEP-517-track lineage. The stub's *runtime*
+behavior is DirtyChai-independent (it never constructs a real engine, exercises no DirtyChai-specific
+logic); the *toolchain* is not — tests against the port need a JDK with `jdk.internal.net.quic`
+present to compile at all, regardless of what they exercise at runtime.
+
 ### 6.3 Export line and SPI surface
 
 - DirtyChai side, now that B1/B2/B3 have landed (§6.1): **one line** still pending in DirtyChai's
@@ -465,7 +477,8 @@ restated here so the correction doesn't get read as absorbing them):
   §3.1 isolation port + DirtyChai lockstep; converts to the OpenJDK public API when published. Per
   §6.2, the port confines but does not sever this dependency — the port's own signatures still name
   internal types, so a future conversion touches the port's contract too, not just its
-  implementation.
+  implementation. This reaches test compilation as well, not only production builds — see §6.2's
+  stock-OpenJDK-25.0.3 finding.
 - **Upstream drift / merge conflicts.** The untouched transport packages merge cleanly from
   `upstream`. However, the **~15 agent15-touching seam files are expected to CONFLICT** on upstream
   merge and need manual reconciliation — only the transport core merges cleanly, not the TLS seam.
