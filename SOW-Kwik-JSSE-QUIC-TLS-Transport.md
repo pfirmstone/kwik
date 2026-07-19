@@ -94,6 +94,25 @@ five subprojects' build files, which this task scoped out ("only core should nee
 left as an open follow-up decision (bump them too, or call `java.disableAutoTargetJvm()`) for
 whoever picks up §3.6 in earnest.
 
+**Reactor-wide toolchain bump — landed 2026-07-19 (commit `07f3b368`, branch
+`build/bump-all-subprojects-jdk27`).** Picked "bump everyone" over `disableAutoTargetJvm()` per the
+open decision above. The toolchain/`options.release=null` block moved from `core/build.gradle` up
+into `buildlogic.java-common-conventions.gradle`, so all six subprojects (`kwik`, `kwik-qlog`,
+`kwik-interop`, `kwik-cli`, `kwik-samples`, `kwik-h09`) now share the Java 27 toolchain; only the
+`--add-exports jdk.internal.net.quic=ALL-UNNAMED` test flags stay core-specific. A genuine
+`./gradlew --offline --no-daemon build` (matching `.github/workflows/gradle.yml`) now clears
+dependency resolution across the whole reactor — the JVM-11-vs-27 edge failure is gone — and
+`:kwik:test --tests "tech.kwik.core.tls.*"` is still 31/31 green. One pre-existing, unrelated
+failure surfaces once the full reactor is actually exercised: `CertificateSelectorTest` (2 of its 6
+cases) fails under a real DirtyChai-27 JVM; reproduced identically against `core` alone at
+`a5dd0916` (i.e. it predates this commit and isn't caused by it) — apparent JSSE
+`X509KeyManagerImpl` issuer-DN-matching behavior difference between whatever JDK it last passed
+under and DirtyChai 27. Left unfixed here as out of this task's scope; flagged for whoever picks
+this up next. Separately, **`.github/workflows/gradle.yml` still provisions stock OpenJDK 17**, not
+a DirtyChai build — since `jdk.internal.net.quic` only exists on DirtyChai, actual GitHub Actions
+CI cannot build this reactor at all as currently configured, independent of this fix. Not addressed
+here (no DirtyChai JDK artifact/publishing story exists yet) — flagged, not solved.
+
 ### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's split calls
 
 **This is a re-architecture of `packet` + both packet parsers, not a deletion.** kwik and the
