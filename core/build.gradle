@@ -5,35 +5,17 @@ plugins {
 // core (module tech.kwik.core) imports jdk.internal.net.quic.* (JEP 517 QuicTLSEngine) directly.
 // That package is only visible via a qualified export baked into the DirtyChai JDK's own
 // java.base module descriptor ("qualified exports jdk.internal.net.quic to java.net.http
-// tech.kwik.core") -- see SOW-Kwik-JSSE-QUIC-TLS-Transport.md §3.6 and §6.2. Two consequences,
-// unique to this subproject, that override the buildlogic.java-common-conventions default of
-// Java 11:
-//   1. core must compile/run against the DirtyChai toolchain specifically (stock OpenJDK has no
-//      jdk.internal.net.quic package at all, per SOW §6.2), so it needs its own toolchain pinned
-//      to language version 27, resolved via gradle.properties'
-//      org.gradle.java.installations.paths.
-//   2. core must NEVER be compiled with javac's --release cross-compilation mode. Verified
-//      empirically (see commit message / SOW update): even `--release 27` -- the DirtyChai JDK's
-//      own version, not a lower one -- cannot see jdk.internal.net.quic at all, because --release
-//      compiles against ct.sym stub API data for that release rather than the real jrt image, and
-//      ct.sym does not carry the JDK-build-specific qualified-export patch. Gradle emits --release
-//      automatically whenever sourceCompatibility/targetCompatibility are set (as the convention
-//      plugin does, to 11); overriding them to 27 does not avoid this because Gradle still treats
-//      an explicit compatibility value as a request for --release. The only way to get a plain,
-//      non-cross-compiling javac invocation is to configure a toolchain and leave
-//      sourceCompatibility/targetCompatibility unset for this subproject, and to force
-//      JavaCompile.options.release to null on top (belt and braces, in case some other mechanism
-//      re-derives it).
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(27)
-    }
-    sourceCompatibility = JavaVersion.toVersion(27)
-    targetCompatibility = JavaVersion.toVersion(27)
-}
-tasks.withType(JavaCompile).configureEach {
-    options.release.set((Integer) null)
-}
+// tech.kwik.core") -- see SOW-Kwik-JSSE-QUIC-TLS-Transport.md §3.6 and §6.2.
+//
+// The Java 27 toolchain wiring + the "never --release-cross-compile" options.release=null force
+// that used to live here (as a core-only override of the convention plugin's Java 11 default) has
+// moved UP into buildlogic.java-common-conventions.gradle and now applies to all six subprojects
+// uniformly -- see that file's comment for the reasoning (in short: the other five subprojects all
+// depend on `project(':kwik')`, and Gradle's variant-aware resolution broke a whole-reactor build
+// the moment core alone targeted a different JVM version than its consumers; bumping everyone is
+// cheaper than disableAutoTargetJvm() since portability to stock OpenJDK was never a goal for this
+// fork). Nothing below is core-specific toolchain config anymore -- just the --add-exports test
+// wiring, which IS still core-specific (see comment below).
 
 // compileJava needs no extra flags: core/src/main/java/module-info.java makes 'core' a real
 // module named tech.kwik.core, and that exact name is already in java.base's qualified-export
@@ -51,16 +33,15 @@ tasks.named('test', Test).configure {
     jvmArgs += ['--add-exports', 'java.base/jdk.internal.net.quic=ALL-UNNAMED']
 }
 
-// KNOWN GAP, left deliberately unfixed here: bumping only 'core' to language level 27 breaks
-// Gradle's variant-aware dependency resolution for the *other* subprojects that depend on it
-// (qlog, interop, cli, samples, h09 all have `implementation(project(':kwik'))`) -- Gradle refuses
-// to let a consumer targeting JVM 11 depend on a producer targeting JVM 27
-// ("Dependency resolution is looking for a library compatible with JVM runtime version 11, but
-// 'project :kwik' is only compatible with JVM runtime version 27 or newer"). ':kwik:compileJava'
-// and ':kwik:test' (this subproject in isolation) are unaffected and green; a whole-reactor
-// './gradlew build' (as CI runs) is not, until/unless those five subprojects either bump too or
-// call `java.disableAutoTargetJvm()`. Not done here: out of this task's stated scope ("only core
-// should need to change").
+// FORMER KNOWN GAP, now closed: bumping only 'core' to language level 27 used to break Gradle's
+// variant-aware dependency resolution for the *other* subprojects that depend on it (qlog, interop,
+// cli, samples, h09 all have `implementation(project(':kwik'))`) -- Gradle refused to let a
+// consumer targeting JVM 11 depend on a producer targeting JVM 27. Fixed by moving the toolchain up
+// into buildlogic.java-common-conventions.gradle so all six subprojects share JVM 27 uniformly (see
+// the comment at the top of this file, and SOW §3.1). A whole-reactor './gradlew build' (as CI
+// runs) is green again as of that change -- though note the *separate* gap that CI's own workflow
+// (.github/workflows/gradle.yml) still provisions stock OpenJDK 17, not a DirtyChai build, so CI
+// itself cannot actually run this reactor at all right now (SOW §3.1 follow-on note).
 
 dependencies {
     implementation group: 'tech.kwik', name: 'agent15', version: "$agent15_version"

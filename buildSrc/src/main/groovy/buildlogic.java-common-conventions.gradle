@@ -9,11 +9,35 @@ plugins {
 
 group = 'tech.kwik'
 
+// All six subprojects (core/'kwik', qlog, interop, cli, samples, h09) share a single Java 27
+// toolchain, pinned to the DirtyChai JDK image via gradle.properties'
+// org.gradle.java.installations.paths. This used to be Java 11 here, with 'core' alone overriding
+// to 27 in core/build.gradle -- but core (module tech.kwik.core) imports
+// jdk.internal.net.quic.* (JEP 517 QuicTLSEngine, see SOW-Kwik-JSSE-QUIC-TLS-Transport.md §3.1/§6.2),
+// which only exists on the DirtyChai JDK, and Gradle's variant-aware dependency resolution refuses
+// to let a JVM-11-targeting consumer depend on a JVM-27-targeting producer -- so the other five
+// subprojects, all of which do `implementation(project(':kwik'))`, broke a whole-reactor
+// './gradlew build' the moment core alone moved. Moving the toolchain up here (rather than
+// disabling auto-target-jvm per edge) is the simpler fix, and costs nothing: portability to stock
+// OpenJDK is an explicit non-goal for this fork (SOW §4) -- its runtime target is DirtyChai only.
+//
+// core must NEVER be compiled with javac's --release cross-compilation mode (verified empirically:
+// --release cannot see jdk.internal.net.quic at ANY release value, including 27 itself, because it
+// compiles against ct.sym stub data rather than the real jrt image -- see core/build.gradle and SOW
+// §3.1 for the full empirical writeup). Gradle emits --release automatically whenever
+// sourceCompatibility/targetCompatibility are set, so BOTH are left unset here and
+// options.release is forced back to null below for every subproject, not just core -- harmless for
+// the other five (they don't touch jdk.internal.net.quic), but keeps the "no --release, ever" rule
+// uniform and avoids re-deriving this per subproject.
 java {
-    sourceCompatibility = JavaVersion.VERSION_11
-    targetCompatibility = JavaVersion.VERSION_11
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(27)
+    }
     withJavadocJar()
     withSourcesJar()
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release.set((Integer) null)
 }
 
 javadoc {
