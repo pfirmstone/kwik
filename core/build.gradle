@@ -2,6 +2,66 @@ plugins {
     id 'buildlogic.java-common-conventions'
 }
 
+// core (module tech.kwik.core) imports jdk.internal.net.quic.* (JEP 517 QuicTLSEngine) directly.
+// That package is only visible via a qualified export baked into the DirtyChai JDK's own
+// java.base module descriptor ("qualified exports jdk.internal.net.quic to java.net.http
+// tech.kwik.core") -- see SOW-Kwik-JSSE-QUIC-TLS-Transport.md §3.6 and §6.2. Two consequences,
+// unique to this subproject, that override the buildlogic.java-common-conventions default of
+// Java 11:
+//   1. core must compile/run against the DirtyChai toolchain specifically (stock OpenJDK has no
+//      jdk.internal.net.quic package at all, per SOW §6.2), so it needs its own toolchain pinned
+//      to language version 27, resolved via gradle.properties'
+//      org.gradle.java.installations.paths.
+//   2. core must NEVER be compiled with javac's --release cross-compilation mode. Verified
+//      empirically (see commit message / SOW update): even `--release 27` -- the DirtyChai JDK's
+//      own version, not a lower one -- cannot see jdk.internal.net.quic at all, because --release
+//      compiles against ct.sym stub API data for that release rather than the real jrt image, and
+//      ct.sym does not carry the JDK-build-specific qualified-export patch. Gradle emits --release
+//      automatically whenever sourceCompatibility/targetCompatibility are set (as the convention
+//      plugin does, to 11); overriding them to 27 does not avoid this because Gradle still treats
+//      an explicit compatibility value as a request for --release. The only way to get a plain,
+//      non-cross-compiling javac invocation is to configure a toolchain and leave
+//      sourceCompatibility/targetCompatibility unset for this subproject, and to force
+//      JavaCompile.options.release to null on top (belt and braces, in case some other mechanism
+//      re-derives it).
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(27)
+    }
+    sourceCompatibility = JavaVersion.toVersion(27)
+    targetCompatibility = JavaVersion.toVersion(27)
+}
+tasks.withType(JavaCompile).configureEach {
+    options.release.set((Integer) null)
+}
+
+// compileJava needs no extra flags: core/src/main/java/module-info.java makes 'core' a real
+// module named tech.kwik.core, and that exact name is already in java.base's qualified-export
+// target list on the DirtyChai JDK, so the module system grants access on its own.
+//
+// The test source set has no module-info.java, so Gradle compiles/runs it on the classpath as
+// the unnamed module -- which is NOT in that qualified-export list (only java.net.http and
+// tech.kwik.core are). --add-exports=...=ALL-UNNAMED is the standard override for exactly this
+// case: it widens the export beyond the module descriptor's own list, both at compile time and
+// (separately, as a JVM arg) at test-run time.
+tasks.named('compileTestJava', JavaCompile).configure {
+    options.compilerArgs += ['--add-exports', 'java.base/jdk.internal.net.quic=ALL-UNNAMED']
+}
+tasks.named('test', Test).configure {
+    jvmArgs += ['--add-exports', 'java.base/jdk.internal.net.quic=ALL-UNNAMED']
+}
+
+// KNOWN GAP, left deliberately unfixed here: bumping only 'core' to language level 27 breaks
+// Gradle's variant-aware dependency resolution for the *other* subprojects that depend on it
+// (qlog, interop, cli, samples, h09 all have `implementation(project(':kwik'))`) -- Gradle refuses
+// to let a consumer targeting JVM 11 depend on a producer targeting JVM 27
+// ("Dependency resolution is looking for a library compatible with JVM runtime version 11, but
+// 'project :kwik' is only compatible with JVM runtime version 27 or newer"). ':kwik:compileJava'
+// and ':kwik:test' (this subproject in isolation) are unaffected and green; a whole-reactor
+// './gradlew build' (as CI runs) is not, until/unless those five subprojects either bump too or
+// call `java.disableAutoTargetJvm()`. Not done here: out of this task's stated scope ("only core
+// should need to change").
+
 dependencies {
     implementation group: 'tech.kwik', name: 'agent15', version: "$agent15_version"
 
