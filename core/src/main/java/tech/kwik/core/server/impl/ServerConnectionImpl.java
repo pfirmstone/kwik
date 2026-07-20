@@ -284,14 +284,21 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
 
     @Override
     public void handshakeSecretsKnown() {
-        connectionSecrets.computeHandshakeSecrets(tlsEngine, tlsEngine.getSelectedCipher());
+        // Pre-Step-D this computed and stored QUIC's Handshake-level secrets on connectionSecrets
+        // (ConnectionSecrets.computeHandshakeSecrets, now deleted); that Aead was never read again
+        // after Step B re-pointed Handshake/App traffic to QuicTlsPort
+        // (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §6.1.2/§11 item 30), so the call is removed
+        // here as dead. Not a §3.3 (handshake-driver seam) change: this method, and the TlsServerEngine
+        // that invokes it, are unchanged otherwise.
         currentEncryptionLevel = EncryptionLevel.Handshake;
     }
 
     @Override
     public void handshakeFinished() {
         currentEncryptionLevel = EncryptionLevel.App;
-        connectionSecrets.computeApplicationSecrets(tlsEngine);
+        // Pre-Step-D this computed and stored QUIC's App-level secrets on connectionSecrets
+        // (ConnectionSecrets.computeApplicationSecrets, now deleted); see the comment in
+        // handshakeSecretsKnown() above -- same reasoning, same doc reference (§11 item 30).
         sender.enableAppLevel();
         // https://www.rfc-editor.org/rfc/rfc9001.html#name-discarding-handshake-keys
         // "An endpoint MUST discard its handshake keys when the TLS handshake is confirmed"

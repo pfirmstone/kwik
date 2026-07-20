@@ -29,19 +29,12 @@ import tech.kwik.core.log.Logger;
 import tech.kwik.core.util.Bytes;
 import tech.kwik.core.util.TriFunction;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public class ConnectionSecrets {
-
-    private TlsConstants.CipherSuite selectedCipherSuite;
 
     // https://tools.ietf.org/html/draft-ietf-quic-tls-29#section-5.2
     public static final byte[] STATIC_SALT_DRAFT_29 = new byte[] {
@@ -71,34 +64,28 @@ public class ConnectionSecrets {
     private final AtomicReferenceArray<Aead> clientSecrets = new AtomicReferenceArray<>(EncryptionLevel.values().length);
     private final AtomicReferenceArray<Aead> serverSecrets = new AtomicReferenceArray<>(EncryptionLevel.values().length);
     private volatile Aead originalClientInitialSecret;
-    private final boolean writeSecretsToFile;
-    private final Path wiresharkSecretsFile;
     private volatile byte[] originalDestinationConnectionId;
     private final AtomicBoolean[] discarded = new AtomicBoolean[EncryptionLevel.values().length];
 
 
+    // The wiresharksecrets parameter is retained, unused, per this rewrite's Step D scope
+    // (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §6.1.2/§11 item 30): the constructor's own row
+    // in §6.1.2's method table says "unchanged," and changing this signature would ripple into every
+    // one of this class's ~15 construction sites (production and test) for no scope-mandated reason.
+    // What did change: the Wireshark secrets-file export machinery this parameter used to feed
+    // (writeSecretsToFile/wiresharkSecretsFile fields, appendToFile(...)) is deleted along with
+    // computeHandshakeSecrets/computeApplicationSecrets, its only callers -- neither computeInitialKeys
+    // nor computeEarlySecrets (the two methods that survive) ever wrote to this file. A caller that
+    // passes a non-null path here (QuicClientConnection.Builder.secrets(Path) / the CLI's -secrets
+    // flag) now gets no error and no file: the option is silently inert. This is a real, if narrow,
+    // capability loss/UX regression beyond what the ADVICE doc's own "worth one line in release notes"
+    // framing anticipated for the Handshake/App secrets export -- flagged for board/Peter attention
+    // rather than silently accepted, since the doc did not analyze this call site.
     public ConnectionSecrets(VersionHolder quicVersion, Role role, Path wiresharksecrets, Logger log) {
         this.quicVersion = quicVersion;
         this.ownRole = role;
         this.log = log;
         Arrays.fill(discarded, new AtomicBoolean(false));
-
-        boolean mustWriteSecretsToFile = false;
-        if (wiresharksecrets != null) {
-            wiresharkSecretsFile = wiresharksecrets;
-            try {
-                Files.deleteIfExists(wiresharkSecretsFile);
-                Files.createFile(wiresharkSecretsFile);
-                mustWriteSecretsToFile = true;
-            }
-            catch (IOException e) {
-                log.error("Initializing (creating/truncating) secrets file '" + wiresharkSecretsFile + "' failed", e);
-            }
-        }
-        else {
-            wiresharkSecretsFile = null;
-        }
-        writeSecretsToFile = mustWriteSecretsToFile;
     }
 
     /**
@@ -203,50 +190,18 @@ public class ConnectionSecrets {
         serverSecrets.set(level.ordinal(), serverAead);
     }
 
-    public void computeHandshakeSecrets(TrafficSecrets tlsTrafficSecrets, TlsConstants.CipherSuite selectedCipherSuite) {
-        this.selectedCipherSuite = selectedCipherSuite;
-
-        byte[] clientHandshakeTrafficSecret = tlsTrafficSecrets.getClientHandshakeTrafficSecret();
-        log.secret("ClientHandshakeTrafficSecret: ", clientHandshakeTrafficSecret);
-        byte[] serverHandshakeTrafficSecret = tlsTrafficSecrets.getServerHandshakeTrafficSecret();
-        log.secret("ServerHandshakeTrafficSecret: ", serverHandshakeTrafficSecret);
-
-        createKeys(EncryptionLevel.Handshake, selectedCipherSuite, quicVersion.getVersion(), false, clientHandshakeTrafficSecret, serverHandshakeTrafficSecret);
-
-        if (writeSecretsToFile) {
-            appendToFile("HANDSHAKE_TRAFFIC_SECRET", EncryptionLevel.Handshake);
-        }
-    }
-
-    public void computeApplicationSecrets(TrafficSecrets secrets) {
-        byte[] clientApplicationTrafficSecret = secrets.getClientApplicationTrafficSecret();
-        log.secret("ClientApplicationTrafficSecret: ", clientApplicationTrafficSecret);
-        byte[] serverApplicationTrafficSecret = secrets.getServerApplicationTrafficSecret();
-        log.secret("ServerApplicationTrafficSecret: ", serverApplicationTrafficSecret);
-
-        createKeys(EncryptionLevel.App, selectedCipherSuite, quicVersion.getVersion(), false, clientApplicationTrafficSecret, serverApplicationTrafficSecret);
-
-        if (writeSecretsToFile) {
-            appendToFile("TRAFFIC_SECRET_0", EncryptionLevel.App);
-        }
-    }
-
-    private void appendToFile(String label, EncryptionLevel level) {
-        List<String> content = new ArrayList<>();
-        content.add("CLIENT_" + label + " "
-                + Bytes.bytesToHex(clientRandom) + " "
-                + Bytes.bytesToHex(clientSecrets.get(level.ordinal()).getTrafficSecret()));
-        content.add("SERVER_" + label + " "
-                + Bytes.bytesToHex(clientRandom) + " "
-                + Bytes.bytesToHex(serverSecrets.get(level.ordinal()).getTrafficSecret()));
-
-        try {
-            Files.write(wiresharkSecretsFile, content, StandardOpenOption.APPEND);
-        }
-        catch (IOException e) {
-            log.error("Writing secrets to file '" + wiresharkSecretsFile + "' failed", e);
-        }
-    }
+    // computeHandshakeSecrets(TrafficSecrets, TlsConstants.CipherSuite)/computeApplicationSecrets
+    // (TrafficSecrets), the selectedCipherSuite field they shared, and appendToFile(String,
+    // EncryptionLevel)/writeSecretsToFile/wiresharkSecretsFile (its Wireshark secrets-file export
+    // machinery, the only caller of which was these two methods) were deleted here: Handshake/App-level
+    // secret derivation moved to QuicTlsPort/QuicTLSEngine in Step B, and by that point nothing reads
+    // an Aead from clientSecrets/serverSecrets at those two ordinals any more (ClientRolePacketParser.
+    // getAead/ServerRolePacketParser.getAead/SenderImpl.send all branch Handshake/App to the port,
+    // Initial/ZeroRTT to this class -- ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §6.1.2). See
+    // §11 item 30 for a doc gap this finding surfaced: the two production call sites of these methods
+    // (QuicClientConnectionImpl/ServerConnectionImpl's handshakeSecretsKnown()/handshakeFinished(),
+    // still driven by the pre-§3.3 TlsClientEngine/TlsServerEngine handshake path) were not in this
+    // document's blast-radius tables and needed their own narrow edit alongside this one.
 
     public void setClientRandom(byte[] clientRandom) {
         this.clientRandom = clientRandom;

@@ -587,8 +587,13 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
 
     @Override
     public void handshakeSecretsKnown() {
-        // Called by TLS engine when handshake secrets are known. So this is the time to compute QUIC's handshake secrets.
-        connectionSecrets.computeHandshakeSecrets(tlsEngine, tlsEngine.getSelectedCipher());
+        // Called by TLS engine when handshake secrets are known. Pre-Step-D this computed and stored
+        // QUIC's Handshake-level secrets on connectionSecrets (ConnectionSecrets.computeHandshakeSecrets,
+        // now deleted); that Aead was never read again after Step B re-pointed Handshake/App traffic to
+        // QuicTlsPort (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §6.1.2/§11 item 30), so the call
+        // is removed here as dead. Not a §3.3 (handshake-driver seam) change: this method, and the
+        // TlsClientEngine that invokes it, are unchanged otherwise -- deriving real Handshake-level keys
+        // for a live QuicTlsPort-driven handshake is still unscoped, future work.
         hasHandshakeKeys();
     }
 
@@ -616,7 +621,9 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
 
     @Override
     public void handshakeFinished() {
-            connectionSecrets.computeApplicationSecrets(tlsEngine);
+            // Pre-Step-D this computed and stored QUIC's App-level secrets on connectionSecrets
+            // (ConnectionSecrets.computeApplicationSecrets, now deleted); see the comment in
+            // handshakeSecretsKnown() above -- same reasoning, same doc reference (§11 item 30).
             currentEncryptionLevel = App;
             synchronized (handshakeStateLock) {
                 if (handshakeState.transitionAllowed(HandshakeState.HasAppKeys)) {
