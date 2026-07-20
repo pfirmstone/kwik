@@ -293,34 +293,47 @@ public class InteropClient {
     }
 
     private static void testKeyUpdate(List<URL> downloadUrls, QuicClientConnectionImpl.Builder builder) throws IOException {
-        // CAPABILITY LOSS (crypto-seam rewrite, Step C -- ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md
-        // §2.4/§10 OQ-1): this method used to call QuicClientConnectionImpl.updateKeys() here,
-        // immediately after the first ~100KB, specifically because the IETF quic-interop-runner's
-        // "keyupdate" test case requires the update to happen early -- "during the first MB
-        // transferred" (quic-interop-runner's own quic.md wording) -- not merely "at some point in the
-        // connection". That on-demand trigger no longer exists: the JDK QuicTLSEngine this fork now
-        // delegates to has no caller-triggerable self-initiated key update at all (it rolls over
-        // autonomously, only at ~80% of the AEAD confidentiality limit -- on the order of millions of
-        // packets, i.e. far more than 1MB of HTTP/0.9 download traffic).
+        // EXPECTED-UNSUPPORTED (crypto-seam rewrite, Step C; disposition accepted by Peter 2026-07-21
+        // -- ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.4/§10 OQ-1 review-outcome block and
+        // §11 items 27-29): this method used to call QuicClientConnectionImpl.updateKeys() here,
+        // immediately after the first ~100KB, to make the client initiate a 1-RTT key update for the
+        // IETF quic-interop-runner's "keyupdate" test case. That on-demand API is gone: the JDK
+        // QuicTLSEngine this fork delegates to has no caller-triggerable key update; rollover is
+        // engine-autonomous, firing at ~80% of the AEAD confidentiality limit
+        // (QuicKeyManager.java:714-719).
         //
-        // Practical effect: this test case can no longer reliably force a key update within the
-        // interop suite's required window by calling into kwik directly. OQ-1's board-recorded
-        // disposition ("delete updateKeys(), document the loss") cited this same interop test as
-        // evidence the deletion was *safe*, reasoning that the engine will still eventually produce
-        // *some* key update during a long-lived connection and "it doesn't matter which peer actually
-        // initiated the update" per the suite's own description -- but that reasoning addressed
-        // whether *a* key update ever occurs, not whether one occurs within the suite's specific
-        // "first MB" timing requirement, which this call site exists specifically to satisfy and can
-        // no longer guarantee. Flagged as a genuine, not merely hypothetical, capability loss --
-        // this is the concrete in-repo case OQ-1's own "unless a board reviewer knows of an
-        // interop-test requirement" carve-out was about. See this rewrite's Step C report.
+        // CORRECTION (2026-07-21 review) to what an earlier revision of this comment claimed: an
+        // engine knob to influence that trigger DOES exist. The security property
+        // "jdk.quic.tls.keyLimits" (read once at static init, sun/security/ssl/QuicCipher.java:52-104;
+        // entry format "AES/GCM/NoPadding 2^23,ChaCha20-Poly1305 -1"; deliberately clamped so it can
+        // only LOWER a cipher's confidentiality limit, never raise it, QuicCipher.java:427-436) lowers
+        // the limit the autonomous trigger keys off, making the engine self-initiate arbitrarily
+        // early. Live-probed: with the limit set to 256, the client self-initiates a key update after
+        // ~205 1-RTT sends. The earlier "no engine API to influence the confidentiality-limit trigger
+        // was found" statement (OQ-1 option (c)) was factually wrong.
         //
-        // No kwik-side substitute exists to restore this test case's timing guarantee (no engine API
-        // to influence the confidentiality-limit trigger was found -- OQ-1 option (c)). Left as a
-        // plain, uninterrupted download so the interop harness at least doesn't fail to *compile* or
-        // *run*; whether the "keyupdate" test case as a whole still passes now depends entirely on
-        // whether the engine's autonomous trigger happens to fire during this transfer, which for a
-        // download this size it will not.
+        // The "keyupdate" case is nevertheless expected-UNSUPPORTED for this fork, for two
+        // independent reasons:
+        //   (a) the quic-interop-runner checker reads key-phase bits from the decrypted pcap, which
+        //       requires an SSLKEYLOG file; without one it returns UNSUPPORTED (not FAILED). This
+        //       fork's engine has no keylog export, and the SOW's core non-goal forbids adding one
+        //       ("traffic secrets never leave the engine") -- so UNSUPPORTED is the designed-in
+        //       outcome, not a regression to fix.
+        //   (b) the SOW's Inc-4 interop deliverable is ">=1 other QUIC implementation (JDK HTTP/3
+        //       client and/or upstream kwik)", not the IETF matrix.
+        // Also correcting the earlier board reading of the test spec: "It doesn't matter which peer
+        // actually initiated the update" describes the initiator-agnostic pcap CHECKER, not the test
+        // setup -- the harness runs the server side in plain "transfer" mode (testcases_quic.py,
+        // TestCaseKeyUpdate.testname(Perspective.SERVER) returns "transfer"), so in practice the
+        // client under test must initiate. And "within the first 1MB" is README prose; the enforced
+        // check is at least one key-phase-1 1-RTT packet from EACH side during a 3MB transfer.
+        //
+        // Disposition (accepted 2026-07-21): accept the capability loss; keep this case
+        // expected-UNSUPPORTED; do NOT add a DirtyChai-side requestKeyUpdate() (a standing
+        // JEP-517-track interface-divergence cost, for no benefit while the case cannot get past
+        // UNSUPPORTED anyway). A companion test driving a real rollover via jdk.quic.tls.keyLimits is
+        // being added separately. Left as a plain, uninterrupted download so the harness still
+        // compiles and runs.
         logger.logPackets(true);
         logger.info("Starting download at " + timeNow());
 

@@ -490,6 +490,14 @@ public class InteractiveShell {
         // and ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.4/§10 OQ-1). Kept as a registered
         // command (rather than removed from the `commands` map) so a user typing "update_keys" gets an
         // explanation instead of "unknown command".
+        //
+        // Nuance corrected on review (2026-07-21): "fully autonomous" overstated it -- the trigger's
+        // TIMING can be influenced process-wide via the "jdk.quic.tls.keyLimits" security property
+        // (sun/security/ssl/QuicCipher.java:52-104; lower-only clamp :427-436), which lowers the AEAD
+        // confidentiality limit the engine's ~80% trigger keys off (QuicKeyManager.java:714-719). But
+        // that is a static-init-time, lower-only knob, not an on-demand per-connection trigger, so it
+        // is no substitute for this command; disposition (accepted 2026-07-21) is to accept the loss.
+        // See the ADVICE doc's §10 OQ-1 review-outcome block.
         System.out.println("update_keys is no longer available: self-initiated key update has no " +
                 "equivalent on the JDK QuicTLSEngine this build uses -- key-phase rollover is fully " +
                 "autonomous inside the engine now, not caller-triggerable. " +

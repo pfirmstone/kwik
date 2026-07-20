@@ -366,6 +366,30 @@ method beyond the interface's own 31 (there is none related to key update) confi
 oversight in the port or an under-read of the interface — it is an actual capability the JDK engine
 does not expose. See open question OQ-1.
 
+**Review outcome (2026-07-21, Fable 5 review; disposition ACCEPTED by Peter 2026-07-21).** Two
+corrections to this section's framing, and the recorded decision:
+
+1. **"No way to influence the trigger" was wrong (OQ-1 option (c) existed after all).** The security
+   property `jdk.quic.tls.keyLimits` (read once at static init,
+   `sun/security/ssl/QuicCipher.java:52-104`; entry format
+   `"AES/GCM/NoPadding 2^23,ChaCha20-Poly1305 -1"`; deliberately clamped lower-only,
+   `QuicCipher.java:427-436`) LOWERS a cipher's AEAD confidentiality limit, making the engine's
+   autonomous trigger (`QuicKeyManager.java:714-719`, fires at 80% of the limit) self-initiate
+   arbitrarily early. Live-probed: limit 256 → client self-initiates at ~205 1-RTT sends. What
+   remains true is narrower than this section stated: there is no *on-demand, per-connection*
+   trigger — only a static-init-time, process-wide, lower-only knob.
+2. **The `keyupdate` interop case is expected-UNSUPPORTED for this fork regardless**, for two
+   independent reasons: (a) the quic-interop-runner checker reads key-phase bits from the decrypted
+   pcap, which requires an SSLKEYLOG file, and returns UNSUPPORTED (not FAILED) without one — this
+   fork's engine has no keylog export and the SOW's core non-goal forbids one ("traffic secrets
+   never leave the engine"); (b) the SOW's Inc-4 interop deliverable is "≥1 other QUIC
+   implementation (JDK HTTP/3 client and/or upstream kwik)", not the IETF matrix.
+3. **Disposition (Peter, accepted 2026-07-21)**: accept the capability loss; mark the `keyupdate`
+   interop case expected-UNSUPPORTED; do NOT add a DirtyChai-side `requestKeyUpdate()` (standing
+   JEP-517-track interface-divergence cost, no benefit while the case cannot get past UNSUPPORTED).
+   A companion test using `jdk.quic.tls.keyLimits` to drive a real rollover is being added
+   separately. Full record in §10 OQ-1's review-outcome block; §11 items 27-29.
+
 ---
 
 ## 3. Call-site re-pointing plan
@@ -1490,6 +1514,38 @@ interop check. It does not rule out some other conformance suite or advanced-cal
 on-demand key update, which is why this remains a recommendation for board sign-off rather than a
 foregone conclusion, but it removes the most obvious interop-suite objection to option (a).
 
+**OQ-1 review outcome (2026-07-21, Fable 5 review; disposition ACCEPTED by Peter 2026-07-21) —
+RESOLVED, with two factual corrections to the text above:**
+
+1. **Option (c) exists — the "this document did not find one" statement above, and Step C's
+   repetition of it ("no engine API to influence the confidentiality-limit trigger was found",
+   InteropClient/§11 item 24), were factually wrong.** The security property
+   `jdk.quic.tls.keyLimits` (`sun/security/ssl/QuicCipher.java:52-104`, a static-init-time read;
+   entry format `"AES/GCM/NoPadding 2^23,ChaCha20-Poly1305 -1"`; deliberate lower-only clamp at
+   `QuicCipher.java:427-436`) can LOWER the AEAD confidentiality limit, making the engine's
+   autonomous trigger (`QuicKeyManager.java:714-719`, 80% of the limit) self-initiate arbitrarily
+   early. Live-probed: limit 256 → client self-initiates at ~205 1-RTT sends. The "arbitrary
+   sometimes signals a configurable value elsewhere that wasn't found" hedge above was exactly
+   right.
+2. **The interop-spec reading above was wrong in a specific way**: "It doesn't matter which peer
+   actually initiated the update" describes the initiator-agnostic pcap CHECKER, not the test
+   setup — the harness runs the server in plain `transfer` mode (`testcases_quic.py`,
+   `TestCaseKeyUpdate.testname(Perspective.SERVER)` returns `"transfer"`), so the client under test
+   must in practice initiate. And "within the first 1MB" is README prose; the enforced check is ≥1
+   key-phase-1 1-RTT packet from EACH side during a 3MB transfer.
+3. **The case is expected-UNSUPPORTED for this fork regardless of items 1-2**: (a) the checker
+   needs an SSLKEYLOG file to read key-phase bits from the decrypted pcap and returns UNSUPPORTED
+   (not FAILED) without one — this fork's engine has no keylog export, and the SOW's core non-goal
+   forbids one ("traffic secrets never leave the engine"); (b) the SOW's Inc-4 interop deliverable
+   is "≥1 other QUIC implementation (JDK HTTP/3 client and/or upstream kwik)", not the IETF matrix.
+4. **Disposition (accepted 2026-07-21)**: accept the capability loss; mark the `keyupdate` interop
+   case expected-UNSUPPORTED; do NOT add a DirtyChai-side `requestKeyUpdate()` (standing
+   JEP-517-track interface-divergence cost, no benefit while the case cannot get past UNSUPPORTED
+   anyway). A companion test using `jdk.quic.tls.keyLimits` to drive a real rollover is being added
+   separately. Call-site comments corrected to match: `InteropClient.testKeyUpdate()` (full form)
+   and `InteractiveShell.updateKeys` (brief form). See §2.4's review-outcome block and §11 items
+   27-29.
+
 **OQ-2 (MEDIUM — now moot, superseded by OQ-4's resolution).** §1.4/§5: compatible version
 negotiation (`ServerRolePacketParser.getAead`, the `getInitialPeerSecretsForVersion` path) needs
 Initial secrets for a *second* QUIC version concurrently with the primary connection's negotiated
@@ -1846,3 +1902,34 @@ once Step C was actually executed, not just planned):**
     classes inherit it, none override it). The doc's own list (§2.3 plus §6.1.1's addendum) was
     exactly right — no additions or corrections needed here, but recorded as confirmed rather than
     assumed (§8, Step C's "DONE" box).
+
+**Corrections added by the post-Step-C interop-disposition review (2026-07-21, Fable 5 review;
+disposition ACCEPTED by Peter 2026-07-21 — see §2.4's and §10 OQ-1's review-outcome blocks for the
+full record):**
+
+27. **OQ-1's "this document did not find one" for option (c) — repeated by Step C as "no engine API
+    to influence the confidentiality-limit trigger was found" (item 24's parenthetical, and the
+    original Step C comments in `InteropClient.testKeyUpdate()`/`InteractiveShell.updateKeys`) —
+    was factually wrong.** The `jdk.quic.tls.keyLimits` security property
+    (`sun/security/ssl/QuicCipher.java:52-104`, static-init-time read; format
+    `"AES/GCM/NoPadding 2^23,ChaCha20-Poly1305 -1"`; lower-only clamp `QuicCipher.java:427-436`)
+    can LOWER the AEAD confidentiality limit, making the engine's autonomous trigger
+    (`QuicKeyManager.java:714-719`, 80% of the limit) self-initiate arbitrarily early — live-probed
+    at limit 256 → self-initiation at ~205 1-RTT sends. Both call-site comments rewritten to state
+    this (§10 OQ-1 review-outcome block, item 1).
+28. **The earlier board reading of the interop spec conflated the checker with the setup, and
+    missed that the case is expected-UNSUPPORTED for this fork anyway.** "It doesn't matter which
+    peer actually initiated the update" describes the initiator-agnostic pcap checker, not the
+    setup — the harness runs the server in plain `transfer` mode (`testcases_quic.py`,
+    `TestCaseKeyUpdate.testname(Perspective.SERVER)` returns `"transfer"`), so the client under
+    test must in practice initiate; "within the first 1MB" is README prose, the enforced check
+    being ≥1 key-phase-1 1-RTT packet from EACH side during a 3MB transfer. Independently, the
+    checker requires an SSLKEYLOG file and returns UNSUPPORTED (not FAILED) without one — which
+    this fork will never provide by design ("traffic secrets never leave the engine", the SOW's
+    core non-goal) — and the SOW's Inc-4 interop deliverable is the JDK HTTP/3 client and/or
+    upstream kwik, not the IETF matrix (§10 OQ-1 review-outcome block, items 2-3).
+29. **OQ-1 disposition ACCEPTED (Peter, 2026-07-21)**: accept the capability loss; mark the
+    `keyupdate` interop case expected-UNSUPPORTED; do NOT add a DirtyChai-side `requestKeyUpdate()`
+    (standing JEP-517-track interface-divergence cost, no benefit while the case cannot get past
+    UNSUPPORTED). A companion test driving a real rollover via `jdk.quic.tls.keyLimits` is being
+    added separately, not by this correction pass (§10 OQ-1 review-outcome block, item 4).
