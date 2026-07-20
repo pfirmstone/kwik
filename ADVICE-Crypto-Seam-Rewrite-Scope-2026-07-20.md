@@ -1048,7 +1048,126 @@ genuine Step B design work, not a Step A decision-and-sign-off item).
 
 **Step B — `QuicPacket`/`ShortHeaderPacket`/`LongHeaderPacket` call-site re-pointing (~4-6 days;
 narrower in level-scope than originally drafted, per the correction below, but with a new
-class-hierarchy design question added — net effort likely similar, see §9).** **Correction, per
+class-hierarchy design question added — net effort likely similar, see §9).**
+
+**DONE, 2026-07-20, branch `impl/crypto-seam-step-b-handshake-app-repointing` (isolated worktree,
+3 production/wiring commits + 1 verification commit, not pushed).** Summary below; the rest of this
+Step B entry (below this box) is left as-is as the historical planning record, per this document's
+own convention — read it for the *plan*, read this box for what actually happened and where it
+differed.
+
+- **Class-hierarchy decision (this step's own open item, resolved as implemented):** the first
+  option this document's own text floated. `QuicPacket`'s existing `Aead`-taking
+  `generatePacketBytes(Aead)`/`parse(ByteBuffer, Aead, long, Logger, int)` keep their exact
+  signatures, unmodified, still abstract-in-spirit (each of the six concrete classes still provides
+  a body). Two new **non-abstract** overloads are added to `QuicPacket`
+  (`generatePacketBytes(QuicTlsPort)`, `parse(ByteBuffer, QuicTlsPort, long, Logger, int)`) with a
+  default body that throws `UnsupportedOperationException`. `InitialPacket`, `ZeroRttPacket`,
+  `RetryPacket`, `VersionNegotiationPacket` never override the new overloads — confirmed genuinely
+  **zero-diff** for all four (§7.1 item 19's prediction holds; `git diff` against `master` shows no
+  changes to any of these four files). `HandshakePacket`/`ShortHeaderPacket` override the new
+  overloads with real port-based logic, **and** override the *old* `Aead`-taking methods to throw
+  `UnsupportedOperationException` too, rather than leave a second, unused-but-still-functioning
+  implementation sitting beside the new one — a deliberate "fail loud if anything still calls the old
+  path" choice, not a "keep both working" one, consistent with the WARN's own "no two authorities for
+  the same thing" theme (here: no two working code paths for the same protection operation, even
+  though only one is a security concern in the strict sense). This is why `HandshakePacketTest`/
+  `ShortHeaderPacketTest`'s pre-existing tests needed real changes (see below), not just a recompile.
+- **The IntFunction header-generator inversion (§2.3/§3) was built as designed** — `ShortHeaderPacket.
+  generatePacketBytes(QuicTlsPort)` captures the engine-resolved header bytes via a
+  `byte[][] resolvedHeader` closure slot inside the callback, used after `encryptPacket` returns for
+  the header-protection-mask XOR step. `KeyUpdateSupport`'s `ShortHeaderPacket`-side call sites
+  (`getKeyPhase()`, `confirmKeyUpdateIfInProgress()`, `cancelKeyUpdateIfInProgress()`) **were removed
+  as a side effect**, confirming §2.3's "likely, per §2.3 — worth checking rather than assuming"
+  prediction. `KeyUpdateSupport.java` itself, `Aead.java`, `ConnectionSecrets.java`,
+  `BaseAeadImpl.java`, `Aes128Gcm.java`/`Aes256Gcm.java`/`ChaCha20.java` were **not** touched, per this
+  task's explicit scope boundary — left as dead code for Step C to delete deliberately. One small loose
+  end for Step C to note: `QuicPacket.decryptPayload`'s `if (this instanceof ShortHeaderPacket) {
+  aead.checkKeyPhase(...) }` check (§2.3's own deletion list) is now permanently unreachable (nothing
+  routes a `ShortHeaderPacket` through the `Aead`-based `decryptPayload` anymore) but was left in place
+  rather than deleted here, to keep Step B's diff to `QuicPacket.java` additive-only and leave the
+  ratchet-code deletion entirely inside Step C's isolated diff as planned.
+- **Real production wiring gap, surfaced by actually attempting this (not previously visible from the
+  planning-stage read):** `PacketParser`/`SenderImpl` need a live `QuicTlsPort` to route Handshake/App
+  traffic to, and no such object is constructed anywhere in `QuicConnectionImpl`/
+  `QuicClientConnectionImpl`/`ServerConnectionImpl` today — engine/port construction is §3.3
+  (handshake-driver seam) work, not built. Resolved by adding a `protected volatile QuicTlsPort
+  tlsPort` field to `QuicConnectionImpl`, deliberately left `null` for now (threaded through the same
+  constructor/field-passing shape `connectionSecrets` already has), with a prominent comment. **This
+  means a real client or server connection on this branch cannot currently complete a live handshake
+  past the Initial exchange** (any real Handshake/App-level send or receive will `NullPointerException`
+  or fail with `QuicKeyUnavailableException`) **until §3.3 lands and populates this field** — this is
+  the expected, flagged shape of a mid-flight staged rewrite on a feature branch, not a silent
+  regression, but it is a real, material fact for whoever sequences Step C/D or §3.3 next: **this
+  branch is not shippable/mergeable to a working `master` on its own; it depends on §3.3 landing
+  first (or concurrently) for kwik to actually establish real connections again.** Confirmed via test
+  audit, not just asserted: every test that exercises the full `SenderImpl`/`PacketParser` call chain
+  for Handshake/App packets uses a `FakeQuicTlsPort` or a real two-engine test harness constructed
+  *within the test*, never the production `QuicConnectionImpl`-owned field — no existing test masks
+  this gap.
+- **Verification — went further than this section's own "extended... once Step C below has
+  `setOneRttContext` wiring available" expectation.** Built a throwaway (test-only, not production)
+  handshake-driving harness (`HandshakeShortHeaderPacketRealEngineRoundTripTest`) that gets two real
+  `QuicTlsPortImpl` engines to genuine `HANDSHAKE_CONFIRMED` state (ClientHello through both Finished
+  messages) in ~2 rounds of a simple pump loop, then round-trips a real `HandshakePacket` (`HANDSHAKE`
+  keyspace) and a real `ShortHeaderPacket` (`ONE_RTT` keyspace) through `generatePacketBytes(port)`/
+  `parse(..., port, ...)` on two independent engine instances, plus a tamper-rejection negative test.
+  **All four tests pass against real cryptography, not `FakeQuicTlsPort`.** Two things had to be
+  discovered empirically, beyond what the existing `QuicTlsPortImplRealEngineTest` (INITIAL-only)
+  precedent showed, and are worth folding into whoever builds the real §3.3 driver:
+  1. `ONE_RTT` `encryptPacket`/`decryptPacket` throw `QuicKeyUnavailableException` even when
+     `keysAvailable(ONE_RTT)` is true, until `port.setOneRttContext(...)` has been called. This
+     document's own correction paragraph below already flagged `QuicOneRttContext` as "trivial to
+     construct" — true, but its *necessity* (not just its triviality) wasn't confirmed until now.
+  2. `isTLSHandshakeComplete()` does not become true from CRYPTO-stream data alone.
+     `NEED_SEND_HANDSHAKE_DONE` (server) / `NEED_RECV_HANDSHAKE_DONE` (client) are QUIC-transport-level
+     bookkeeping states (RFC 9001 §4.1.2's `HANDSHAKE_DONE` frame) that the caller must drive via
+     `tryMarkHandshakeDone()`/`tryReceiveHandshakeDone()` — without this, the server's `HandshakeState`
+     wedges at `NEED_SEND_HANDSHAKE_DONE` forever and `ONE_RTT` decrypt keeps throwing "QUIC TLS
+     handshake not yet complete", even though keys are nominally available. **This was not anticipated
+     anywhere in this document** and is new information for §3.3's scope, not just this test harness's.
+  3. `decrypt1`/`decrypt3` in the old `HandshakePacketTest` (parsing hardcoded externally-captured
+     ciphertext against Handshake secrets injected via a mocked `TlsClientEngine`) have **no port-based
+     equivalent** — raw secret injection is exactly what this rewrite removes — and were marked
+     `@Disabled` rather than force-fit or silently deleted. A genuine, narrow, permanent loss of test
+     coverage (verification against external test vectors specifically), not fully compensated for by
+     the self-consistent and real-engine round-trip tests above (which prove internal
+     consistency/correctness against *this* engine, not against an independently-sourced reference).
+- **Test suite: 994 tests, 991 successes, 0 failures, 3 skipped** (1 pre-existing skip + `decrypt1`/
+  `decrypt3` above). Confirmed `InitialPacketTest`/`ZeroRttPacketTest`/`RetryPacketTest`/
+  `VersionNegotiationPacketTest` all pass, and their production files are untouched (`git diff`
+  confirms zero changes to `InitialPacket.java`, `ZeroRttPacket.java`, `LongHeaderPacket.java`,
+  `RetryPacket.java`, `VersionNegotiationPacket.java`).
+- **Files touched beyond §3's own six call sites, worth recording precisely:** production —
+  `QuicTlsPort.java` (`toKeySpace`), `QuicPacket.java`, `HandshakePacket.java`,
+  `ShortHeaderPacket.java`, `PacketParser.java`, `ClientRolePacketParser.java`,
+  `ServerRolePacketParser.java`, `SenderImpl.java`, `QuicConnectionImpl.java`,
+  `QuicClientConnectionImpl.java`, `ServerConnectionImpl.java` (the last three purely for the
+  `tlsPort` field/threading, not logic). Test — `HandshakePacketTest.java`, `ShortHeaderPacketTest.java`
+  (real fixture migration, pulled forward from Step D's anticipated 7-file list, forced by the
+  production rewrite, not scope creep), `SenderImplTest.java`, `PacketAssemblerTest.java`,
+  `GlobalPacketAssemblerTest.java`, `AbstractSenderTest.java` (shared dispatch helper), `MockPacket.java`
+  (generic `EncryptionLevel.App`-defaulting test double, needed a trivial port-based override too),
+  `FakeQuicTlsPort.java` (made public, reused across packages, enhanced with a fake auth tag so
+  length-accounting assertions stay meaningful, gained `makeKeysAvailable(KeySpace)`), plus six files
+  needing only a mechanical `(Aead) null` disambiguation or a new `null`/`QuicTlsPort` constructor
+  argument (`RetryPacketTest.java`, `VersionNegotiationPacketTest.java`, `ServerConnectionImplTest.java`,
+  `ServerConnectorImplTest.java`, `ClientRolePacketParserTest.java`, `ServerRolePacketParserTest.java`
+  — none of these exercise a Handshake/App path, no logic changes), plus the new
+  `HandshakeShortHeaderPacketRealEngineRoundTripTest.java`.
+- **Effect on Step C/D and §9's estimate:** see the updated §9 paragraph below. Short version: Step C's
+  scope is *slightly smaller* than planned (the `ShortHeaderPacket`-side ratchet call sites are already
+  gone; Step C's remaining job is `KeyUpdateSupport.java` + `Aead.java`'s ratchet methods +
+  `ConnectionSecrets.createKeys()`'s `App`-branch unwrap + the one still-dead `instanceof
+  ShortHeaderPacket` check in `QuicPacket.decryptPayload`), and Step D is unaffected. The **new,
+  material item for whoever plans next** is the production-wiring gap above: Step C/D's own effort
+  estimates were written assuming Step B would leave a connectable, if incompletely-secured, system;
+  it does not. Getting kwik back to "can complete a real handshake" requires §3.3 (or at least a
+  minimal slice of it — real per-connection `QuicTlsPort` construction and wiring into
+  `QuicConnectionImpl`) alongside or before Step C/D, not strictly after them as the original four-step
+  ordering implied.
+
+**Correction, per
 §3/§6.1.1/§6.1.2's finalized scope: this step now applies to `HandshakePacket` and
 `ShortHeaderPacket` (App/1-RTT) only — not `InitialPacket` or `ZeroRttPacket`, which keep the
 existing `Aead`-taking path permanently (§6.1.1/§6.1.2).** Rewrite the Handshake/App call sites in
@@ -1157,6 +1276,20 @@ written against an assumption that might be wrong (A before B).
 ---
 
 ## 9. Effort/risk estimate for the crypto-seam portion specifically
+
+**Step B closed 2026-07-20 (see §8's Step B entry for the full report).** Actual effort was in the
+originally-estimated 4-6 day band. The class-hierarchy question resolved cheaply (non-abstract
+default-throwing overloads, ~an hour of design time, not a source of schedule risk in practice). The
+real cost driver was the production-wiring gap §8's Step B entry describes (no `QuicTlsPort` anywhere
+in `QuicConnectionImpl` to route to) — not itself expensive to work around (a nullable field, same
+shape as `connectionSecrets`), but it is new, load-bearing information for planning Step C/D and §3.3's
+sequencing: **this branch does not restore kwik to a connectable state on its own; §3.3 (or a slice of
+it) is now a prerequisite for kwik to complete a real handshake again, not strictly a later,
+independent step.** The real-engine `HANDSHAKE`+`ONE_RTT` round-trip verification (§8 Step B) also
+surfaced two engine-usage requirements (`QuicOneRttContext` is not just "trivial", it's *necessary*;
+`HANDSHAKE_DONE`-frame bookkeeping via `tryMarkHandshakeDone`/`tryReceiveHandshakeDone` is required for
+`isTLSHandshakeComplete()` to ever become true) that were not previously documented anywhere in this
+file and should be folded into whoever scopes §3.3's actual driver next — see §11 items 20-21.
 
 The SOW's §7.2a correction already isolates "key-update relocation" as "+5d on top of the floor
 table's crypto-seam line" and separately budgets "Delete `ConnectionSecrets` AEAD/HKDF; delegate to
@@ -1522,3 +1655,60 @@ board/Peter sign-off on items 7-13 above and OQ-4 recorded at the top of this do
     document), `RetryPacket`/`VersionNegotiationPacket` need no edit at all, not even a mechanical
     one. Flagged for Step B to confirm against whatever class-hierarchy shape it actually picks,
     rather than assumed either way (§7.1, §8 Step B).
+
+**Corrections added while executing Step B (this revision, 2026-07-20; Step B is DONE, see §8's Step B
+entry for the full report — items below are the corrections to this document's own earlier text that
+executing it, not just planning it, surfaced):**
+
+20. **Item 19's "confirm against whatever class-hierarchy shape it actually picks" is now confirmed
+    true, not just plausible** — `RetryPacket.java` and `VersionNegotiationPacket.java` needed zero
+    changes (`git diff` against `master` confirms), matching this document's own "zero-diff" framing
+    exactly. Non-abstract, default-throwing port-taking overloads on `QuicPacket` were the shape used
+    (§8, Step B's "DONE" box) — the "keep the `Aead`-taking signature as-is, add new separate
+    port-taking method(s)" option this document floated without picking, rather than a shared-helper
+    or sealed-interface alternative.
+21. **New finding, not anticipated anywhere in this document before Step B was actually attempted: no
+    `QuicTlsPort` exists anywhere in `QuicConnectionImpl`/`QuicClientConnectionImpl`/
+    `ServerConnectionImpl` for `PacketParser`/`SenderImpl` to route Handshake/App traffic to** — real
+    per-connection engine/port construction is §3.3 (handshake-driver seam) work, not built by any
+    step this document scopes. Step B resolves this locally with a nullable `QuicTlsPort tlsPort`
+    field on `QuicConnectionImpl` (same shape as `connectionSecrets`), which is sufficient for Step
+    B's own scope (the call sites correctly *select* the port when one exists) but means **a real
+    connection on this branch cannot complete a live handshake past the Initial exchange until §3.3
+    lands and populates that field** — this branch is not independently shippable, contrary to what a
+    naive reading of the original four-step (A/B/C/D) ordering in §8 would suggest. Whoever sequences
+    §3.3 against Step C/D should treat this as a hard dependency, not a nice-to-have: getting kwik back
+    to "can complete a real handshake" needs at least a minimal slice of §3.3 (real port construction +
+    wiring into `QuicConnectionImpl`) alongside or before Step C/D, not strictly after them.
+22. **Two engine-usage requirements for `ONE_RTT`, discovered only by actually driving a real
+    handshake for Step B's verification, not previously documented here or apparently anywhere else in
+    this document series:**
+    - `QuicOneRttContext` (§8 Step B's "trivial to construct" framing, per item 12/§8's Step B
+      correction) is not just trivial — it is **required**. `encryptPacket`/`decryptPacket(ONE_RTT,
+      ...)` throw `QuicKeyUnavailableException` even when `keysAvailable(ONE_RTT)` is true, until
+      `port.setOneRttContext(...)` has been called at least once.
+    - `isTLSHandshakeComplete()` does not become true from CRYPTO-stream data (`consumeHandshakeBytes`/
+      `getHandshakeBytes`) alone. `HandshakeState.NEED_SEND_HANDSHAKE_DONE` (server)/
+      `NEED_RECV_HANDSHAKE_DONE` (client) are QUIC-transport-level bookkeeping states (RFC 9001
+      §4.1.2's `HANDSHAKE_DONE` frame) that the caller must drive explicitly via
+      `tryMarkHandshakeDone()`/`tryReceiveHandshakeDone()` — without this, `ONE_RTT` decrypt keeps
+      throwing "QUIC TLS handshake not yet complete" indefinitely, even though keys are nominally
+      available per `keysAvailable`.
+
+    Neither requirement is exercised by `QuicTlsPortImplRealEngineTest`'s existing `INITIAL`-only
+    coverage (Initial keys need neither). Both are almost certainly required by §3.3's real production
+    driver too, not just this test harness's throwaway pump loop — flagged here so §3.3's scoping
+    doesn't rediscover them from scratch (§8, Step B's "DONE" box).
+23. **`decrypt1`/`decrypt3` (the two `HandshakePacketTest` cases that parsed hardcoded,
+    externally-captured ciphertext against Handshake secrets injected via a mocked `TlsClientEngine` +
+    `ConnectionSecrets.computeHandshakeSecrets(...)`) have no port-based equivalent and were marked
+    `@Disabled`, not deleted or force-fit.** `QuicTlsPort` never accepts externally-supplied traffic
+    secrets — that is exactly the "raw secrets never requested" property this rewrite exists to
+    establish (§3.2's stated security point) — so there is no way to reconstruct a fixture that
+    exercises "decrypt this exact known-good ciphertext" under the new model. This is a genuine, narrow,
+    permanent loss of test coverage (verification against an externally-sourced reference, as opposed
+    to self-consistency or correctness against *this* engine specifically), not raised or anticipated
+    anywhere earlier in this document. The real-engine round-trip tests added for Step B verification
+    (item 22 above) are a different, weaker property (internal consistency) and do not substitute for
+    it. Worth a one-line callout in whatever release notes eventually describe this rewrite's test
+    coverage changes.
