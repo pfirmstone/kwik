@@ -1240,6 +1240,95 @@ the cipher suite classes, `at.favre.lib.hkdf`), which stays in Step D exactly as
 `ConnectionSecrets` diff should note that the `KeyUpdateSupport` wrapping is already gone by the time
 Step D starts, rather than re-deriving that fact.
 
+**DONE, 2026-07-20, branch `impl/crypto-seam-step-c-key-update-deletion` (isolated worktree,
+2 commits: 1 production/wiring, 1 test-only, not pushed).** Summary below; the rest of this Step C
+entry (above this box) is left as-is as the historical planning record, per this document's own
+convention — read it for the *plan*, read this box for what actually happened and where it differed.
+
+- **Deletions, exactly as scoped, verified against the actual source rather than assumed from the
+  doc's own list.** `KeyUpdateSupport.java` deleted entirely. `Aead.java`: read in full against
+  `BaseAeadImpl.java`/`Aes128Gcm.java`/`Aes256Gcm.java`/`ChaCha20.java` first, confirming precisely
+  which ratchet methods were `default` (interface-only, deleted from `Aead.java` alone) vs.
+  non-default (`computeNextApplicationTrafficSecret()`, implemented exactly once, in
+  `BaseAeadImpl.java` — `Aes128Gcm`/`Aes256Gcm`/`ChaCha20` all inherit it, none override any ratchet
+  method directly) — the doc's own §2.3/§6.1.1 list was exhaustive and confirmed correct by this
+  check, not just trusted. Deleted the seven default methods from `Aead.java` and the one
+  implementation from `BaseAeadImpl.java`. `ConnectionSecrets.createKeys()`'s App-level branch
+  (confirmed at `:195-203` in this branch's checkout, unchanged line numbers from the doc's own
+  citation) removed per the circularity-fix correction above — `clientAead`/`serverAead` now flow
+  straight into `clientSecrets.set(...)`/`serverSecrets.set(...)` as plain `Aead`s, exactly as
+  specified. `QuicPacket.decryptPayload`'s dead `instanceof ShortHeaderPacket` check deleted, after
+  confirming freshly (not on Step B's word alone) that `ShortHeaderPacket.parse(ByteBuffer, Aead,
+  ...)` throws `UnsupportedOperationException` unconditionally, so no `ShortHeaderPacket` instance can
+  ever reach it.
+- **`updateKeys()` — deleted per OQ-1's recorded recommendation (option (a)), replaced with an
+  explanatory comment at the deletion site** citing §2.4/§10 OQ-1 (autonomous engine-side rollover,
+  no caller-triggerable equivalent, ~80% of the AEAD confidentiality limit).
+- **New finding, not anticipated by OQ-1's own text: `updateKeys()` had two real, in-repo callers
+  outside `core`, not merely hypothetical external ones.** `interop/src/main/java/tech/kwik/interop/InteropClient.java`'s
+  `testKeyUpdate()` — the driver for the IETF `quic-interop-runner`'s "keyupdate" test case, the exact
+  interop check OQ-1's own resolution text cites as evidence deletion is safe — called
+  `((QuicClientConnectionImpl) connection).updateKeys()` directly, and
+  `cli/src/main/java/tech/kwik/cli/InteractiveShell.java` had an `update_keys` interactive command
+  that did the same. Both needed real edits, not just to keep the reactor compiling (confirmed via
+  `:kwik-interop:compileJava`/`:kwik-cli:compileJava`, both green) but to avoid a silent behavior
+  change: `InteropClient.testKeyUpdate()` now documents, at the deletion site, a nuance OQ-1's
+  resolution glossed over — OQ-1 reasoned the interop suite only needs *a* key update to occur
+  somewhere in the connection (true, and the engine's autonomous trigger will eventually satisfy
+  that), but the suite's actual requirement, quoted in its own `quic.md`, is narrower: the update must
+  happen *"during the first MB transferred."* The engine's ~80%-confidentiality-limit autonomous
+  trigger needs on the order of tens of millions of packets, far more than a 1MB test transfer, so
+  this specific interop test case's *timing* requirement can no longer be satisfied on demand by
+  kwik — a real, concrete instance of the "interop-test requirement" OQ-1's own carve-out
+  anticipated might exist, not a hypothetical one. `InteractiveShell.java`'s `update_keys` command is
+  kept registered but now prints an explanation instead of calling into the deleted API. See §11 item
+  24 and this rewrite's Step C report for the full detail — **flagged for board/Peter attention**,
+  since it's a materially different risk profile than OQ-1's resolution text implied.
+- **New test, per §7.2's flagged gap**: `KeyUpdateRatchetRemovalRealEngineRoundTripTest.java`, built
+  on Step B's `HandshakeShortHeaderPacketRealEngineRoundTripTest` fixture (its `pump`/
+  `configureMinimal`/`trustAllClientSide` helpers widened from `private` to package-private for
+  direct reuse, no logic change). Three tests: ordinary multi-packet `ShortHeaderPacket`/`ONE_RTT`
+  round-tripping with zero kwik-side key-phase state; a flipped-key-phase-bit test (flips only the K
+  bit in an already-protected wire packet, the closest practically-reachable analogue to a genuine
+  key-phase mismatch without forcing an actual rollover, and confirms the real engine's own internal
+  speculative-decrypt-against-next-phase-keys logic fails safely); and an ordinary ciphertext-tamper
+  test for `ShortHeaderPacket` against a real engine (no equivalent existed anywhere before —
+  `ShortHeaderPacketTest.java` only uses `FakeQuicTlsPort`). **Honestly documented in the test class's
+  own javadoc**: none of these force an actual key-phase rollover — the engine's self-initiated
+  trigger is autonomous and has no caller-facing knob to lower its threshold (confirmed by this
+  rewrite's own research), so driving a real rollover in a fast unit test is not practical and was not
+  attempted. 7/7 tests pass, including the flipped-key-phase test genuinely producing a real
+  `DecryptionException` from the engine.
+- **Test suite: 997 tests, 994 successes, 0 failures, 3 skipped** (baseline 994/991/0/3 plus the 3 new
+  key-update tests, all passing; the 3 skips are unchanged from Step B — 1 pre-existing
+  (`ServerConnectorImplTest`) + `decrypt1`/`decrypt3` (`HandshakePacketTest`)). `InitialPacket.java`,
+  `ZeroRttPacket.java`, `RetryPacket.java`, `VersionNegotiationPacket.java` confirmed byte-identical to
+  `master` (`git diff master -- <file>` empty for all four).
+- **Full-repo grep sweep** (all six subprojects, not just `core`) for `KeyUpdateSupport`, the deleted
+  `Aead` ratchet method names, and `updateKeys` after all edits: zero remaining references to
+  callable production code — only explanatory comments this step added, and the CLI's own
+  identically-named `updateKeys(String arg)` command-handler method (a distinct, private method that
+  no longer calls the deleted API, kept only as the dispatch target for the `update_keys` command
+  name).
+- **Files changed**: production — `Aead.java`, `BaseAeadImpl.java`, `ConnectionSecrets.java`,
+  `KeyUpdateSupport.java` (deleted), `QuicClientConnectionImpl.java`, `QuicPacket.java`,
+  `ShortHeaderPacket.java` (comment-only update to a Step-B-era comment that had gone stale),
+  `interop/InteropClient.java`, `cli/InteractiveShell.java`. Test —
+  `HandshakeShortHeaderPacketRealEngineRoundTripTest.java` (visibility-only), new
+  `KeyUpdateRatchetRemovalRealEngineRoundTripTest.java`.
+- **Residual uncertainty, stated plainly per this task's own brief rather than asserted away**: high
+  confidence, not absolute certainty, that no kwik-side key-phase state remains. What was verified:
+  every ratchet method/class named in §2.3/§6.1.1 is gone (confirmed by reading the actual interface/
+  implementers, not just the doc's list); the sole `KeyUpdateSupport` construction site is gone; the
+  one dead `instanceof ShortHeaderPacket` check is gone; a full-repo grep (not just `core`) for every
+  deleted symbol name found zero dangling references; the full suite is green at the expected count.
+  What was *not*, and could not practically be, verified: whether the real engine's own internal
+  key-phase bookkeeping has any behavioral dependency on how kwik previously drove it (e.g. call
+  ordering/timing assumptions) that this rewrite's real-engine round-trip tests wouldn't surface,
+  since those tests exercise normal-volume traffic only, never anywhere near the engine's actual
+  rollover threshold — this is the same honestly-stated gap the new test's own javadoc documents, not
+  a new one.
+
 **Step D — `ConnectionSecrets`/dependency cleanup + full suite (~2-3 days; scope now finalized, not
 conditional on Step A — corrected below, net effect is smaller than the earlier "delete
 `ConnectionSecrets`" framing implied).** **Correction: this step no longer deletes
@@ -1712,3 +1801,48 @@ executing it, not just planning it, surfaced):**
     (item 22 above) are a different, weaker property (internal consistency) and do not substitute for
     it. Worth a one-line callout in whatever release notes eventually describe this rewrite's test
     coverage changes.
+
+**Corrections added while executing Step C (this revision, 2026-07-20; Step C is DONE, see §8's Step C
+entry for the full report — items below are corrections/additions this document's own text needed
+once Step C was actually executed, not just planned):**
+
+24. **OQ-1's resolution text understated a risk it partially anticipated: `updateKeys()` had a real,
+    in-repo caller that specifically exists to satisfy the exact interop test OQ-1 cited as evidence
+    deletion was safe, and that caller's timing requirement is narrower than OQ-1's reasoning
+    accounted for.** `interop/src/main/java/tech/kwik/interop/InteropClient.java`'s `testKeyUpdate()`
+    calls `updateKeys()` specifically to satisfy the IETF `quic-interop-runner`'s "keyupdate" test
+    case — the same test case OQ-1's resolution paragraph (§10) cites via web search of `quic.md`.
+    OQ-1's reasoning was: since the suite is "indifferent to which peer initiated the update" and the
+    engine autonomously triggers rollover eventually anyway, deleting `updateKeys()` is safe for this
+    check. **That reasoning addressed only "does a key update occur," not the suite's actual quoted
+    requirement — "during the first MB transferred"** (also in `quic.md`, also available to the
+    original research, but not weighed against the engine's ~80%-confidentiality-limit threshold,
+    which for AES-128-GCM needs on the order of tens of millions of packets — far beyond a 1MB test
+    transfer). Net effect: OQ-1's disposition (delete, per board sign-off) is unchanged by this
+    correction — the board already approved deletion with documentation, and no engine-side knob to
+    force early rollover was found either before or during Step C — but the *specific, concrete*
+    consequence is sharper than OQ-1's own text suggested: this isn't a hypothetical future external
+    caller losing a nice-to-have, it's kwik's own interop test harness losing the ability to reliably
+    pass one specific, real IETF conformance test case on demand. `InteropClient.testKeyUpdate()` was
+    updated to compile and to document this at the call site rather than leave it undiscovered by a
+    future reader trying to understand why the "keyupdate" interop run started failing (§8, Step C's
+    "DONE" box).
+25. **`updateKeys()` had a second in-repo caller not anticipated by OQ-1/§2.4's framing either**:
+    `cli/src/main/java/tech/kwik/cli/InteractiveShell.java`'s interactive `update_keys` command. Not a
+    conformance-test consequence like item 24, but the same underlying point — this method was never
+    purely hypothetical "external API surface," it had real callers inside this same repository,
+    outside `core`, that a `core`-scoped grep sweep alone would not find. Resolved by keeping the
+    command registered with an explanatory message rather than deleting it or leaving it uncompilable
+    (§8, Step C's "DONE" box).
+26. **§2.3/§6.1.1's ratchet-method deletion list for `Aead.java`/`BaseAeadImpl.java` is confirmed
+    exhaustive, not merely restated.** Step C re-read `Aead.java` against `BaseAeadImpl.java`,
+    `Aes128Gcm.java`, `Aes256Gcm.java`, and `ChaCha20.java` specifically to verify which ratchet
+    methods were `default` (interface-only) vs. non-default before deleting anything, per this task's
+    own instruction not to assume the doc's list was complete. Result: all seven ratchet methods
+    (`checkKeyPhase`/`computeKeyUpdate`/`confirmKeyUpdateIfInProgress`/`cancelKeyUpdateIfInProgress`/
+    `getKeyPhase`/`getKeyUpdateCounter`/`setPeerAead`) are `default` on `Aead.java`, with zero
+    overrides anywhere in the three cipher-suite classes; `computeNextApplicationTrafficSecret()` is
+    the sole non-default one, implemented exactly once, in `BaseAeadImpl.java` (all three cipher
+    classes inherit it, none override it). The doc's own list (§2.3 plus §6.1.1's addendum) was
+    exactly right — no additions or corrections needed here, but recorded as confirmed rather than
+    assumed (§8, Step C's "DONE" box).
