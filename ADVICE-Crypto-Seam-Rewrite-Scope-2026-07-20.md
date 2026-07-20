@@ -228,15 +228,57 @@ implementation (`sun/security/ssl/QuicKeyManager.java`, the `OneRttKeyManager` i
   a private `maybeInitiateKeyUpdate(currentSeries, packetNumber)` (`:708-744`) on **every** encrypt
   call. That method's own comment: *"based on certain internal criteria, this method may trigger a
   key update"* — the criterion is a hardcoded **80% of the AEAD cipher's confidentiality limit**
-  (`:711-719`, `"which is arbitrary"` per the engine's own code comment), gated by RFC 9001 §6.1's
-  "peer must have acked a packet in the current phase" rule (`initiateKeyUpdate`, `:746-773`, via
-  `CipherPair.usedByBothEndpoints()`). **There is no public method on `QuicTLSEngine` — and none on
+  (`:711-719`, `"which is arbitrary"` per the engine's own code comment). **Correction to an earlier
+  draft of this section**: that trigger is gated by `initiateKeyUpdate` (`:746-773`) checking
+  `CipherPair.usedByBothEndpoints()`, and `usedByBothEndpoints()` (`QuicKeyManager.java:87-90`) is
+  `readCipher.hasDecryptedAny() && writeCipher.hasEncryptedAny()` (both defined in
+  `QuicCipher.java:241` and `:309`) — i.e. it checks only that *some* packet has been successfully
+  encrypted and decrypted under the current-phase keys in each direction, not that a packet was
+  specifically *acknowledged* in the current phase, which is RFC 9001 §6.1's literal text ("An
+  endpoint MUST NOT initiate a subsequent key update unless it has received an acknowledgment for a
+  packet that was sent protected with keys from the current key phase" — quoted verbatim in
+  `initiateKeyUpdate`'s own comment at `:750-757`, immediately above the weaker check the code
+  actually performs). This is a looser proxy for the RFC's ack-based gate, not a literal
+  implementation of it. Practically inert: the only thing that trips `maybeInitiateKeyUpdate` at all
+  is the 80%-confidentiality-limit heuristic above, which needs on the order of millions of packets
+  to reach, so by the time it fires, ACKs will certainly have flowed in both directions regardless of
+  whether the engine specifically tracked them — but the doc should describe the actual gating
+  condition precisely rather than assert literal ack-gating. **There is no public method on
+  `QuicTLSEngine` — and none on
   `QuicTLSEngineImpl` beyond the interface either, confirmed by grepping the whole implementation
   file — that lets a caller request "roll over the 1-RTT write keys now."** The `headerGenerator`
   callback passed to `encryptPacket` receives whatever key phase the engine has already decided on
   (`:682-684`: `writeCipher.getKeyPhase()` is read *after* `maybeInitiateKeyUpdate` has possibly
   already rolled over) — the caller is a passive recipient of the engine's decision, never a driver
   of it.
+
+### 2.2.1 Correction: old-key retention is a net improvement, not a neutral trade
+
+One further point the earlier draft did not surface, confirmed by reading both sides again
+specifically for this question: **kwik's current code retains zero old keys after a key-phase
+rollover, which is itself a live RFC 9001 §6.5 gap today, and the engine fixes it as a side effect of
+this rewrite — this should be stated as an improvement, not filed only under "what gets deleted."**
+
+- **kwik today**: `KeyUpdateSupport.confirmKeyUpdateIfInProgress()` (`KeyUpdateSupport.java:130-139`)
+  does `keyUpdateCounter++; aead = updatedAead; updatedAead = null;` — the previous-phase `aead`
+  reference is simply overwritten and dropped. Nothing is preserved for a delayed or reordered packet
+  that arrives late, still tagged with the *old* key phase, after a rollover has already been
+  confirmed. RFC 9001 §6.5 ("Receiving Packets Before a Key Update Completes") expects exactly this
+  case to be handled — decrypting delayed prior-phase packets is not optional, it is the specific
+  scenario the section exists for — and kwik's current code cannot do it once
+  `confirmKeyUpdateIfInProgress()` has run.
+- **The engine**: `OneRttKeyManager.KeySeries` (`QuicKeyManager.java:471-521`) carries an explicit
+  `old` field (a `QuicReadCipher`, not just the current one) alongside `current`/`next`, and
+  `canUseOldDecryptKey(pktNum)` (`:503-520`) gates its use on whether `pktNum` is lower than the
+  lowest packet number the *current* key has decrypted so far — directly implementing RFC 9001 §6.5's
+  delayed-packet allowance, citing the RFC section in its own comment (`:515`). `decryptPacket`
+  (`:584-648`) uses this: on a key-phase mismatch it first tries `series.canUseOldDecryptKey` before
+  concluding a genuine update is in progress (`:611-648`).
+- **Net effect on this rewrite**: this is not merely "the engine's ratchet replaces kwik's ratchet
+  with different internal plumbing" — it is a **strict correctness improvement**, closing a gap that
+  exists in kwik's shipped code today. Worth stating plainly when this rewrite is presented for review
+  or in release notes: the crypto-seam rewrite doesn't just simplify the key-update path, it fixes a
+  real RFC-conformance gap along the way.
 
 ### 2.3 The exact, unambiguous boundary (what to delete, what replaces it)
 
@@ -366,51 +408,164 @@ design goal) — translation happens once, at the seam, not scattered.
 
 ## 5. The gap §3.2/§3.5 don't surface: one engine holds only one `INITIAL` key set at a time
 
-Confirmed by reading `sun/security/ssl/QuicTLSEngineImpl.java:698-709`
-(`deriveInitialKeys` delegates to `this.initialKeyManager.deriveKeys(...)`) and
-`QuicKeyManager.java:93-100` (each per-`KeySpace` manager, including the `InitialKeyManager`, holds
-a **single** `keySeries`/`CipherPair` — not a map keyed by connection ID or version). This is
-strong structural evidence (not an exhaustive trace of `deriveKeys()`'s body) that **calling
-`deriveInitialKeys` a second time on the same engine instance replaces the current Initial keys, it
-does not layer a second set alongside the first.** Flagged as needing a short confirming spike
-before implementation (§8, and OQ-4) — in the same spirit as the SOW's week-1 spike, this is cheap
-to verify empirically and should not be assumed either way without doing so.
+### 5.1 The single-slot collision — CONFIRMED, not merely structural evidence (Step A's spike is DONE)
 
-If confirmed, this collides with **three** real call sites found in §1.4/§1.6, none of which the
-SOW's §3.2/§3.5 write-up anticipates, because both sections implicitly assume "one engine per
-connection" is the whole story:
+**Correction to the earlier draft: this is no longer a "flagged as needing a spike" open item — it
+has been empirically confirmed.** The structural evidence stands as before (reading
+`sun/security/ssl/QuicTLSEngineImpl.java:698-709`, `deriveInitialKeys` delegates to
+`this.initialKeyManager.deriveKeys(...)`; `QuicKeyManager.java:93-100`, `93` area, each
+per-`KeySpace` manager holds a **single** `keySeries`/`CipherPair` field, not a map keyed by
+connection ID or version) — and it is now backed by both a direct code citation and an empirical
+result:
 
-1. **Post-Retry dual retention.** `ConnectionSecrets.recomputeInitialKeys(byte[])` (`:130-134`)
-   explicitly preserves the *old* Initial `Aead` (`originalClientInitialSecret`) alongside the *new*
-   one, because a client Initial packet sent before the Retry arrived may still show up and needs
-   the old DCID-derived keys to decode (`getOriginalClientInitialAead`, `:284-291`). Call sites:
-   `QuicClientConnectionImpl.java:691`, `ServerConnectionImpl.java:485,635`.
-2. **Compatible version negotiation.** Both packet parsers (§1.4) construct a second, throwaway
-   Initial-only secret set for a *different* QUIC version while the primary connection continues
-   under its negotiated version.
-3. **Pre-connection candidate/refusal packets.** `ServerConnectorImpl`/`ServerConnectionCandidate`
-   (§1.6) need Initial keys with **no connection and no engine instance at all** yet.
+- **Direct proof in the engine's own code**: `InitialKeyManager.deriveKeys(...)`
+  (`QuicKeyManager.java:255-337`) reads, at `:322-330`:
+  ```
+  final CipherPair old = this.cipherPair;
+  // we don't check if keys are already available, since it's a
+  // valid case where the INITIAL keys are regenerated due to a
+  // RETRY packet from the peer or even for the case where a
+  // different quic version was negotiated by the server
+  this.cipherPair = new CipherPair(readCipher, writeCipher);
+  if (old != null) {
+      old.discard(true);
+  }
+  ```
+  The engine's own comment names *exactly* the Retry and version-negotiation cases this document
+  independently identified below, and confirms its own design intent is "regenerate in place," not
+  "layer a second set." `old.discard(true)` actively destroys the previous `CipherPair` (both the
+  read and write ciphers), it does not merely drop a reference to it.
+- **Empirical confirmation, run for this document's review round**: a board reviewer constructed a
+  real DirtyChai engine (`QuicTlsPortImpl.forClient`/`forServer` over a genuine `SSLContext`, the
+  same construction path as the week-1 spike), called `deriveInitialKeys` twice with two different
+  DCIDs on the same engine instance, kept the `Aead`/cipher object returned after the *first* call,
+  and attempted to decrypt a packet that had been encrypted under the *first* derivation's keys,
+  after the *second* derivation had run. Result: `AEADBadTagException` — the first key set is
+  unusable after the second `deriveInitialKeys` call, exactly as `old.discard(true)` above predicts.
 
-**Why this is not simply "another instance of the WARN's raw-secrets problem"**: RFC 9001 §5.2's
-Initial secrets are, by design, not confidential — they're deterministically derived from a public
-value (the destination connection ID) and a hardcoded public salt; RFC 9001 itself frames Initial
-protection as defense against off-path/on-path corruption and identifiability, not confidentiality
-from a capable observer. So unlike Handshake/Application secrets, keeping a narrow, INITIAL-only
-HKDF path alive for these three cases would **not** reopen the "raw secrets never requested"
-security property the fork is built around (§3.2's stated security point is about the negotiated
-TLS secrets that back Handshake/App protection, not the public Initial derivation). This gives the
-design a legitimate third option beyond "spin up a full throwaway engine+SSLContext" or "construct
-two port instances per connection": keep `ConnectionSecrets`'s existing HKDF-only Initial-derivation
-code (`computeInitialSecret`/the `Aes128Gcm`-via-`createKeys(Initial,...)` path) alive, scoped
-*strictly* to `EncryptionLevel.Initial`/`KeySpace.INITIAL`, as a deliberate, narrow, documented
-exception to "everything else goes through the port." This is a real design fork, not a foregone
-conclusion — see OQ-4/OQ-5 for the three concrete options and why this document does not pick one.
+**This confirms the single-slot-per-engine-instance claim as settled fact, not a hypothesis.** What
+remains open is not *whether* this collision is real, but *which design response* (§5.3/OQ-4) each
+of the three colliding call sites should use — that decision is still for the board, per §5.3 below.
+
+### 5.2 Three call sites, examined individually for a concurrent-key requirement
+
+The original draft treated these three call sites as a single, undifferentiated problem needing one
+uniform answer among options (a)/(b)/(c). A follow-up review re-examined each site individually,
+specifically asking: *does this site ever need two different Initial key sets usable at the same
+instant*, the way the single-slot collision in §5.1 would break, *or is "derive right before use,
+then discard" always sufficient?* The three sites turn out to have materially different shapes, and
+one piece of the follow-up's own working hypothesis was refuted by this closer read — see the
+specific findings below, then §5.3 for the recommendation that follows once the evidence is in.
+
+1. **Post-Retry dual retention — genuinely needs two live Initial key sets, open-endedly.**
+   `ConnectionSecrets.recomputeInitialKeys(byte[])` (`:130-134`) is called from exactly one call site
+   that does real dual retention: `ServerConnectionImpl.java:485`, inside `process(InitialPacket,
+   ...)`'s `retryRequired` branch, immediately after `sendRetry()`. (Correction to the earlier
+   draft's citation: `QuicClientConnectionImpl.java:691` and `ServerConnectionImpl.java:635` call the
+   *no-arg* `recomputeInitialKeys()` overload, used for version-negotiation recompute — a different,
+   single-slot-replacing operation, not dual retention; they are call site 2 below, not part of this
+   site.) `recomputeInitialKeys(byte[])` stashes the pre-Retry client Initial `Aead` into
+   `originalClientInitialSecret` (`:131`) *before* overwriting the primary Initial slot, and
+   `getOriginalClientInitialAead()` (`:284-291`) returns that stashed value for as long as it is
+   non-null — read by `ServerRolePacketParser.getAead` (`:70`) whenever a token-less Initial packet
+   arrives while `retryRequired` is set. **Checked specifically for this document: how long must the
+   old key set remain usable?** There is no timeout, deadline, or state-transition in the code that
+   ever clears `originalClientInitialSecret` — it is set once (on Retry) and never reset for the rest
+   of the `ConnectionSecrets` object's life. Notably, `discardKeys(Initial)`
+   (`ServerConnectionImpl.java:553`, fired on the server's first successfully-processed Handshake
+   packet, per RFC 9001's "discard Initial keys" rule) nulls the `clientSecrets`/`serverSecrets`
+   arrays but does **not** clear `originalClientInitialSecret` — a separate field entirely — so in
+   the current code `getOriginalClientInitialAead()` would still return the stale pre-Retry keys even
+   after Initial keys are nominally "discarded" (a latent quirk worth a note for whoever implements
+   this, not a defect this document is scoping a fix for). **Conclusion: this site's requirement is
+   genuinely open-ended dual retention with no bound coded anywhere** — the strongest possible form
+   of the concurrent-two-key-sets need, and the one squarely incompatible with a single-slot engine.
+
+2. **Compatible version negotiation — also needs two live Initial key sets, refuting this
+   document's own working hypothesis for this site.** The follow-up hypothesis that motivated this
+   review assumed sites 2 and 3 were "derive, use immediately, discard," with no concurrent-old-key
+   need. **That assumption is wrong for site 2, and the evidence for why is in the code's own RFC
+   citation.** `ServerRolePacketParser.getAead` (`:93-97`) has a branch guarded by
+   `versionNegotiationStatusSupplier.get() == VersionChangeUnconfirmed`, whose comment quotes RFC
+   9369 directly: *"The server MUST NOT discard its original version Initial receive keys until it
+   successfully processes a packet with the negotiated version."* Tracing the trigger
+   (`ServerConnectionImpl.java:635`/`QuicClientConnectionImpl.java:691`, the no-arg
+   `recomputeInitialKeys()`): when the server (or client) switches its *primary* Initial keys over to
+   the newly-negotiated version, RFC 9369 explicitly requires the *original*-version Initial receive
+   keys to keep working until a negotiated-version packet is confirmed — i.e., during the
+   `VersionChangeUnconfirmed` window, both the primary (new-version) and the original-version Initial
+   key sets must be decodable, because a client Initial packet in either version may legitimately
+   still arrive. **This is the same shape of requirement as site 1**, not the "derive-use-discard"
+   shape the hypothesis assumed. Where site 2 *does* differ from site 1 in a way that matters for the
+   design choice: it does not need a **persisted** old-key object the way site 1's
+   `originalClientInitialSecret` field is persisted state. `ConnectionSecrets.getInitialPeerSecretsForVersion(Version)`
+   (`:142-144`) and `ClientRolePacketParser.getAead`'s alt-version branch (`:62-68`) both recompute
+   the alt-version Initial secret **fresh, from scratch, on every single call** — a pure function of
+   the (public DCID, version, fixed RFC salt) triple, with no ratchet state, no caching, and no
+   reliance on anything surviving between calls. Because Initial secrets have no negotiated/ephemeral
+   component (§5.1's confidentiality point again), re-deriving identically on every call costs nothing
+   functionally — it is not an optimization being skipped, it is simply how this code already works,
+   and it happens to sidestep the single-slot problem entirely, *provided* the recomputation doesn't
+   share a slot with whatever holds the *primary* connection's own current-version Initial keys. If
+   it did share that slot, deriving the alt-version secret would destroy the primary connection's own
+   live Initial keys — a real hazard, not a hypothetical one, and a reason this site cannot safely
+   reuse the connection's *own* per-connection engine's `INITIAL` keyspace for this purpose.
+
+3. **Pre-connection candidate/refusal packets — a genuine multi-threaded concurrency hazard, refuting
+   the implicit "single receive loop, so it's safe" assumption.** The two sub-sites here are not
+   symmetric, and this matters for whether option (c)'s shared engine is safe:
+   - `ServerConnectorImpl.sendConnectionRefused` (`:377-390`) is confirmed single-threaded: its
+     caller, `processInitial` (`:363-375`), has its own comment stating *"this method is only called
+     from one thread (see receiveLoop)"* — i.e. genuinely serialized with itself, no self-concurrency.
+   - `ServerConnectionCandidate.parseInitialPacket`/`parsePackets` (`:146-176`) is **not** on that
+     thread. `parsePackets`'s own comment: *"Execute packet parsing on separate thread, to make this
+     method return a.s.a.p."* — it dispatches via `executor.submit(...)`, and `executor` is
+     `context.getSharedServerExecutor()` (`ServerConnectionCandidate.java:116`), the *same*
+     `ThreadPoolExecutor(1, 10, ...)` pool constructed in `ServerConnectorImpl` (`:148-151`,
+     `maxSharedExecutorThreads = 10`). The `synchronized(this)` block inside `parsePackets` (`:153`)
+     serializes processing *per candidate object*, explicitly noted as being for duplicate-packet
+     ordering ("duplicate initial packets might arrive faster than they are processed") — it is
+     **not** a global lock. Confirmed by reading the constructor: every new `ServerConnectionCandidate`
+     (`ServerConnectorImpl.java:406`, one per prospective connection) gets its own candidate-scoped
+     lock, submitted to the shared pool.
+   
+   **Conclusion**: up to 10 different `ServerConnectionCandidate` instances can call into their own
+   Initial-key derivation *truly concurrently*, on different worker-pool threads, and that can also
+   run concurrently with `ServerConnectorImpl.sendConnectionRefused` on the dedicated receive-loop
+   thread. There is **no invariant in the current code, documented or otherwise, that serializes
+   Initial-key derivation across the server's accept path** — the opposite is true by explicit
+   design (dispatching to a worker pool exists specifically to let the receive loop return fast under
+   load). A shared single engine instance (option (c) as literally read — "held once per
+   `ServerConnector`") would need a **new** lock added around derive-then-use for every candidate and
+   every refusal, serializing exactly the traffic this pool was built to parallelize — under the kind
+   of Initial-packet flood where that parallelism matters most (a plausible DoS-amplification shape,
+   not merely a style concern). This directly contradicts any assumption that this site "can
+   genuinely never run concurrently" — it can, routinely, under normal (non-adversarial) load with
+   more than one connection attempt in flight, and the code deliberately makes this so.
+
+### 5.3 Resolution — see §10, OQ-4, for the concrete per-site recommendation
+
+Putting §5.1 and §5.2 together: the single-slot collision is real and confirmed (§5.1); site 1
+genuinely needs open-ended dual retention (§5.2.1); site 2 *also* genuinely needs concurrent
+old-version/new-version retention, contrary to this document's own initial working hypothesis, though
+via a stateless recompute-on-demand mechanism rather than a persisted object (§5.2.2); and site 3 has
+a real, code-confirmed multi-threaded concurrency hazard that makes a shared engine unsafe without
+adding a new lock (§5.2.3). **Why this is not simply "another instance of the WARN's raw-secrets
+problem," and why a narrow carve-out is legitimate at all**: RFC 9001 §5.2's Initial secrets are, by
+design, not confidential — they're deterministically derived from a public value (the destination
+connection ID) and a hardcoded public salt; RFC 9001 itself frames Initial protection as defense
+against off-path/on-path corruption and identifiability, not confidentiality from a capable observer.
+So unlike Handshake/Application secrets, keeping a narrow, INITIAL-only HKDF path alive for these
+three cases does **not** reopen the "raw secrets never requested" security property the fork is built
+around (§3.2's stated security point is about the negotiated TLS secrets that back Handshake/App
+protection, not the public Initial derivation). See §10/OQ-4 for how this evidence resolves to a
+concrete recommendation.
 
 ---
 
 ## 6. Dependency cleanup — verified, not assumed
 
-### 6.1 `at.favre.lib.hkdf` — conditionally droppable, not unconditionally
+### 6.1 `at.favre.lib.hkdf` — retained, Initial-only, per §5.3/OQ-4's resolved recommendation
 
 Repo-wide grep (`--include=*.java .` from the repo root, plus `build.gradle`/`module-info.java`
 greps) confirms **exactly five source files** use `at.favre.lib.hkdf`, and no others exist anywhere
@@ -419,14 +574,19 @@ in the reactor (`qlog`, `cli`, `interop`, `samples`, `h09` all clean):
 `core/build.gradle:49-50` declares it; `module-info.java:3` requires it
 (`requires at.favre.lib.hkdf;`).
 
-All five files are wholly deleted or gutted by this rewrite for Handshake/App-level material — **but
-per §5, if the resolution to the Initial-key-multiplicity gap is "keep a narrow HKDF-only Initial
-path," then `ConnectionSecrets` (in reduced form) and the dependency itself survive, scoped to
-Initial only.** So: **confirmed droppable only if §5's gap is resolved by moving all three Initial
-use-cases onto full/throwaway engine instances; retained, but with a much smaller blast radius (one
-class, Initial-only), if any of §5's three use-cases keeps the HKDF path.** This is a direct,
-evidence-based correction of the SOW's unconditional "likely drops" (§3.2's "Dependency cleanup"
-bullet) — it should read as conditional on the §5 decision, not as a standalone item.
+Four of the five (`BaseAeadImpl.java`, `ChaCha20.java`, `Aes256Gcm.java`, and the Handshake/App-level
+paths of `ConnectionSecrets.java`) are deleted/gutted by this rewrite, as before. **Updated per
+§5.3/OQ-4's resolved recommendation (option (a), uniformly, for all three Initial-key-multiplicity
+call sites — no longer conditional on a future board choice among three options, since the evidence
+in §5.2 converges on one answer): `ConnectionSecrets` survives in reduced, Initial-only form, and so
+does the dependency itself, scoped strictly to Initial-level HKDF derivation.** `Aes128Gcm.java`
+specifically also survives (it's the concrete `Aead` implementation `createKeys(Initial, ...)` and
+`getInitialPeerSecretsForVersion` construct) — the other three cipher-suite classes
+(`Aes256Gcm`/`ChaCha20`, plus `BaseAeadImpl`'s Handshake/App-level machinery) do not, since Initial
+secrets are always `TLS_AES_128_GCM_SHA256` per RFC 9001 §5.2, never cipher-suite-negotiated. This
+finalizes what the earlier draft of this document left conditional on a future §5 decision — the
+"likely drops" framing in the SOW's §3.2 "Dependency cleanup" bullet should be read as **"retained,
+Initial-only, one class + the dependency,"** not as dropped, pending only the OQ-4 sign-off in §5.3.
 
 ### 6.2 `io.whitfin.siphash` — confirmed stays, exactly as the SOW says
 
@@ -447,18 +607,38 @@ crypto-seam rewrite regardless of how §5 resolves.
 Full inventory, from repo-wide greps of `ConnectionSecrets`, `KeyUpdateSupport`, `BaseAeadImpl`,
 `Aes128Gcm`, `Aes256Gcm`, `ChaCha20`:
 
-- `core/src/main/java/tech/kwik/core/crypto/`: `ConnectionSecrets.java` (deleted/reduced, §5/§6.1),
-  `CryptoStream.java` (**out of this scope's remit**, §1.2), `KeyUpdateSupport.java` (deleted, §2.3),
-  `Aead.java` (interface — most methods deleted, some may remain if §5 keeps a narrow Initial path),
-  `BaseAeadImpl.java`, `Aes128Gcm.java`, `Aes256Gcm.java`, `ChaCha20.java` (all deleted, or all but
-  one retained in reduced Initial-only form per §5), `MissingKeysException.java` (semantics
-  preserved via `QuicKeyUnavailableException`/`keysAvailable`, not necessarily the same class — see
-  §1.1).
+- `core/src/main/java/tech/kwik/core/crypto/`: `ConnectionSecrets.java` (**reduced, not deleted**, to
+  an Initial-only shape, per §5.3/§6.1's resolved recommendation), `CryptoStream.java` (**out of this
+  scope's remit**, §1.2), `KeyUpdateSupport.java` (deleted, §2.3), `Aead.java` (interface — most
+  methods deleted; the ratchet methods per §2.3 and the Handshake/App `aeadEncrypt`/`aeadDecrypt`
+  plumbing go, but the interface itself and its Initial-relevant methods remain, implemented by
+  `Aes128Gcm`), `BaseAeadImpl.java`, `Aes256Gcm.java`, `ChaCha20.java` (deleted — Handshake/App-level
+  cipher-suite machinery, no longer needed once those levels go through the port), `Aes128Gcm.java`
+  (**retained**, Initial-only — it's the concrete `Aead` `createKeys(Initial, ...)` and
+  `getInitialPeerSecretsForVersion` construct, and Initial is always
+  `TLS_AES_128_GCM_SHA256` per RFC 9001 §5.2), `MissingKeysException.java` (semantics preserved via
+  `QuicKeyUnavailableException`/`keysAvailable` for Handshake/App levels, retained as-is for the
+  Initial-only `ConnectionSecrets` — see §1.1).
 - `core/src/main/java/tech/kwik/core/packet/`: `QuicPacket.java`, `ShortHeaderPacket.java` (rewrite,
   §2.3/§3), `LongHeaderPacket.java` (calls the rewritten `QuicPacket` methods but needs no method-
   body changes itself, confirmed by its two call sites both being into `QuicPacket`'s shared
   helpers), `PacketParser.java`, `ClientRolePacketParser.java`, `ServerRolePacketParser.java`
-  (§1.4/§3), `RetryPacket.java` (**not** touched by this document's scope, §4 table).
+  (§1.4/§3), `RetryPacket.java` and `VersionNegotiationPacket.java` — **correction, added on
+  review: these two are NOT untouched.** Both files `import tech.kwik.core.crypto.Aead`
+  (`RetryPacket.java:23`, `VersionNegotiationPacket.java:23`) and both override the abstract
+  `QuicPacket` methods this rewrite changes the signature of — `parse(ByteBuffer, Aead, long, Logger,
+  int)` (`RetryPacket.java:130`, `VersionNegotiationPacket.java:73`) and `generatePacketBytes(Aead)`
+  (`RetryPacket.java:216`, `VersionNegotiationPacket.java:139`) — confirmed by grep that neither
+  method body ever dereferences the `aead` parameter (zero `aead.` call sites in either method): 
+  `RetryPacket` computes its own static-key AEAD integrity tag directly via `javax.crypto.Cipher`
+  (RFC 9001 §5.8's fixed public key, independent of TLS secrets, per §4's table), and
+  `VersionNegotiationPacket` has no encryption at all (it's a cleartext packet type). So when
+  `QuicPacket`'s abstract signatures change to take `QuicTlsPort`/`KeySpace` instead of `Aead`
+  (§3/§4), **both files need a mechanical, signature-only edit** — updating the parameter type on
+  these two overrides to keep the class compiling — even though neither file's actual logic changes
+  at all. Call this out explicitly in the implementation step (§8) so whoever does this doesn't
+  accidentally start "fixing" the real retry-integrity-tag or version-negotiation logic while
+  touching these files for what should be a one-line signature edit each.
 - `core/src/main/java/tech/kwik/core/impl/QuicConnectionImpl.java` (`:162`, `ConnectionSecrets`
   construction → port/engine construction, but the *triggering* calls — `computeInitialKeys`,
   `computeHandshakeSecrets`, etc. — live in `QuicClientConnectionImpl`/`ServerConnectionImpl` and
@@ -515,15 +695,17 @@ Given the scale (§9) and the SOW's own preference for gated spikes over big-ban
 precedent), the crypto-seam rewrite specifically — as distinct from the driver seam (§3.3) — breaks
 into four independently-verifiable increments:
 
-**Step A — Key-space mapping spike + the §5 decision (prerequisite, ~2-3 days).** Before touching
-`QuicPacket.java` at all: (1) empirically confirm or refute §5's "single Initial-key-slot per
-engine" claim with a small spike analogous to the week-1 one (construct one engine, call
-`deriveInitialKeys` twice with different DCIDs, confirm whether the first Initial `Aead` state
-becomes unusable); (2) get an explicit board/Peter decision on which of OQ-4's three options
-resolves the three call sites in §5; (3) only then finalize the `EncryptionLevel`↔`KeySpace`
-mapping and, if applicable, the reduced `ConnectionSecrets` shape. This step produces no rewritten
-`QuicPacket` code — it's a decision-and-verification gate, matching the week-1 spike's role for the
-driver seam.
+**Step A — Key-space mapping + the §5 decision (prerequisite, ~1-2 days, reduced from ~2-3 now that
+the spike is done).** **Correction: the empirical spike this step originally scoped is
+CONFIRMED, not pending** — §5.1 records both the direct code proof (`QuicKeyManager.java:322-330`'s
+`old.discard(true)`) and the empirical result (real DirtyChai engine, two `deriveInitialKeys` calls,
+`AEADBadTagException` on the stale key), run for this document's review round. What Step A still
+needs to do, now narrower than originally scoped: (1) get an explicit board/Peter sign-off on §5.3/
+OQ-4's resolved recommendation (option (a), uniformly, for all three call sites — the analysis is
+done, per-site, in §5.2; this is a sign-off gate, not open investigation); (2) finalize the
+`EncryptionLevel`↔`KeySpace` mapping and the reduced `ConnectionSecrets` shape (Initial-only) once
+that sign-off lands. This step still produces no rewritten `QuicPacket` code — it's a
+decision-and-sign-off gate, not a verification spike anymore.
 
 **Step B — `QuicPacket`/`ShortHeaderPacket`/`LongHeaderPacket` call-site re-pointing (~4-6 days).**
 Rewrite the six call sites in §3 to talk to `QuicTlsPort` instead of `Aead`, including the
@@ -536,9 +718,21 @@ naturally removes their only call sites as a side effect (likely, per §2.3 — 
 than assuming). Verify with a targeted round-trip test mirroring the week-1 spike (real two engines,
 one INITIAL packet each direction, tamper-byte negative path) extended to cover a `ShortHeaderPacket`/
 `ONE_RTT` round trip once Step C below has `setOneRttContext` wiring available from the driver-seam
-work (this step may need to borrow a minimal stub from §3.3 rather than waiting for it fully, since
-`ONE_RTT` round-tripping needs *some* handshake to have happened first — flag this cross-seam
-dependency explicitly to whoever sequences §3.2 against §3.3).
+work.
+
+**Correction — the §3.3 dependency here is more than "a minimal stub," sharpen accordingly.** The
+earlier draft's phrasing ("may need to borrow a minimal stub from §3.3") understates this. The stub
+object itself — `QuicOneRttContext` — is trivial to construct. What is not trivial is *reaching a
+state where it's needed*: `port.keysAvailable(QuicTLSEngine.KeySpace.ONE_RTT)` only becomes true
+after real TLS 1.3 handshake messages have been driven through the engine via
+`consumeHandshakeBytes(KeySpace, ByteBuffer)`/`getHandshakeBytes(KeySpace)` (both already on
+`QuicTlsPort.java:137-144`) far enough to derive 1-RTT traffic secrets — that is real §3.3
+handshake-driver-seam work (a minimal but genuine ClientHello/ServerHello/Finished exchange through
+the engine), not a trivial test fixture. A future implementer reading only "borrow a minimal stub"
+could reasonably assume this is a five-minute mock; it is closer to standing up a cut-down version of
+§3.3's own driver before Step B's `ONE_RTT` round-trip test can even begin. Flag this cross-seam
+dependency explicitly, and size it accordingly, to whoever sequences §3.2 against §3.3 — Step B's
+`INITIAL`/`HANDSHAKE`-level round-trip coverage has no such dependency and can proceed independently.
 
 **Step C — Key-update ratchet deletion, as its own isolated, carefully-reviewed step (~2-3 days,
 matching §7.2a's "+5d" line but split from the rest of the crypto-seam work deliberately).** Delete
@@ -549,6 +743,26 @@ reviewer to confirm "no kwik-side key-phase state remains" by inspection of a sm
 change, rather than needing to audit it as one hunk inside a much larger `QuicPacket` rewrite. Add
 the new targeted key-update test flagged in §7.2 here.
 
+**Correction — Step C/D circularity, found and fixed on review.** As originally drafted, Step C
+deleted `KeyUpdateSupport.java` outright, but `new KeyUpdateSupport(...)` is constructed at exactly
+two lines, both inside `ConnectionSecrets.createKeys()` (`ConnectionSecrets.java:198-199` — confirmed
+by grep as the *sole* construction site anywhere in the tree), and the doc assigned all of
+`ConnectionSecrets`'s cleanup to Step D. Taken literally, Step C's diff would delete the class while
+leaving `ConnectionSecrets.createKeys()` still referencing it — the build breaks between Step C and
+Step D, contradicting §8's own "each step independently verifiable" design goal. **Fix: Step C's diff
+must also include the narrow edit to `createKeys()`'s `App`-level branch (`:195-203`) that removes the
+`KeyUpdateSupport` wrapping and `setPeerAead` cross-registration, replacing it with a direct
+`clientSecrets.set(...)`/`serverSecrets.set(...)` of the plain `Aead` — i.e. the same 8-ish lines
+`ConnectionSecrets.java` would need touched either way, pulled forward into Step C instead of left for
+Step D.** This is deliberately the *narrowest* fix, not "merge C into D" or "reorder them": it keeps
+Step C's own stated purpose (an isolated, reviewable diff proving no kwik-side key-phase state
+remains) intact — arguably strengthens it, since the reviewer can now see in the same small diff both
+"the class is gone" and "its one call site no longer references it" — without dragging Step C into
+`ConnectionSecrets`'s much larger dependency-cleanup scope (deleting the whole class, `BaseAeadImpl`,
+the cipher suite classes, `at.favre.lib.hkdf`), which stays in Step D exactly as before. Step D's
+`ConnectionSecrets` diff should note that the `KeyUpdateSupport` wrapping is already gone by the time
+Step D starts, rather than re-deriving that fact.
+
 **Step D — `ConnectionSecrets`/dependency cleanup + full suite (~2-3 days, scope depends on Step
 A's decision).** Delete (or reduce, per §5) `ConnectionSecrets.java`, `BaseAeadImpl.java`,
 `Aes128Gcm.java`, `Aes256Gcm.java`, `ChaCha20.java`; remove `at.favre.lib.hkdf` from
@@ -556,7 +770,9 @@ A's decision).** Delete (or reduce, per §5) `ConnectionSecrets.java`, `BaseAead
 migration (§7.2); re-point `SenderImpl.java:421` and the `ServerConnectorImpl`/
 `ServerConnectionCandidate` sites per Step A's chosen option; run the full `core` suite (baseline:
 990 tests, 989 pass / 1 pre-existing skip, per the RSA-fixture ADVICE doc's verification record) and
-confirm no new failures beyond ones explicitly expected from this rewrite.
+confirm no new failures beyond ones explicitly expected from this rewrite. (By this point,
+`createKeys()`'s `App`-level `KeyUpdateSupport` wrapping has already been removed in Step C per the
+correction above — Step D's `ConnectionSecrets` diff is the rest of the file.)
 
 This ordering keeps `KeyUpdateSupport`'s deletion — the single highest-consequence item per the
 WARN — in its own small, reviewable step (C) rather than buried inside the larger AEAD re-pointing
@@ -573,13 +789,16 @@ engine encrypt/decrypt/HP in the packet path" at 3-5 days (§7.2's table) — ca
 baseline **8-10 days**. This document's findings push that estimate up, concentrated in two places
 not previously accounted for:
 
-- **§5's Initial-key-multiplicity gap is new scope, not covered by any existing line in §7.2/§7.2a.**
-  Depending on which of OQ-4's three options is chosen, this could range from "no extra cost" (if
-  the narrow-HKDF-retention option is chosen, since that's close to today's code) to **+3-5 days**
-  (if the "second throwaway engine per use case" option is chosen, since that means threading
-  `SSLContext` availability into `ServerConnectorImpl`/`ServerConnectionCandidate`, which don't have
-  one today, plus handling the possibility that even a throwaway engine construction is too heavy
-  for the server's single-threaded receive-loop hot path in `ServerConnectorImpl`).
+- **§5's Initial-key-multiplicity gap is new scope, not covered by any existing line in §7.2/§7.2a —
+  now resolved to the low-cost end of the original range.** §5.3/OQ-4 resolves to option (a),
+  narrow HKDF-only retention, for all three call sites — close to today's code, no `SSLContext`
+  plumbing into `ServerConnectorImpl`/`ServerConnectionCandidate` needed, and no new locking around
+  the shared-executor concurrency hazard found in §5.2.3 (since (a)'s per-call construction has no
+  shared mutable state to lock). **Updated cost: modest, not the "+3-5 days" upper bound this
+  document originally flagged for the throwaway/shared-engine options** — mostly the work of
+  reducing `ConnectionSecrets` to its Initial-only shape (§6.1/§7.1) and re-pointing the three call
+  sites to it, which is close to a no-op relative to today's code since they already use this exact
+  code path.
 - **The `ShortHeaderPacket.generatePacketBytes` structural rewrite (§2.3/§3) is more invasive than
   "delegate to engine encrypt/decrypt/HP" suggests.** The header-generator-callback inversion is a
   genuine control-flow change, not a substitution, and it is the one place where a subtle bug (e.g.
@@ -603,11 +822,11 @@ findings are accounted for explicitly.
 
 **What could make it harder than even this revised estimate:**
 
-- Step A's spike (§8) confirming the *worse* of the two Initial-key-multiplicity outcomes, and OQ-4
-  landing on the "second engine instance" option after all — the `SSLContext` plumbing into
-  `ServerConnectorImpl`/`ServerConnectionCandidate` could itself uncover further gaps (e.g. whether
-  a server-role engine construction requires client-address-specific SNI/ALPN context that isn't
-  cleanly available at the pre-connection candidate stage).
+- **Superseded by §5.3/OQ-4's resolution**: the earlier draft flagged the risk of Step A's spike
+  confirming the worse outcome and OQ-4 landing on a throwaway/shared-engine option, requiring
+  `SSLContext` plumbing into `ServerConnectorImpl`/`ServerConnectionCandidate`. The spike is now
+  done (§5.1) and OQ-4 resolves to option (a) (§5.3), which needs none of that plumbing — this risk
+  no longer applies unless the board's sign-off on §5.3's recommendation overturns it.
 - The engine's autonomous 80%-confidentiality-limit key-update trigger (§2.2) interacting with
   kwik's own AEAD-limit tracking/connection-close-on-limit logic, if any exists elsewhere in the
   transport (not investigated as part of this document — flagged as a possible follow-up check
@@ -639,27 +858,48 @@ found. Recommend (a), with prominent documentation, unless a board reviewer know
 requirement that specifically needs on-demand key update — but this is a judgment call, not
 something this document can resolve unilaterally.
 
-**OQ-2 (MEDIUM).** §1.4/§5: compatible version negotiation (`ServerRolePacketParser.getAead`, the
-`getInitialPeerSecretsForVersion` path) needs Initial secrets for a *second* QUIC version
-concurrently with the primary connection's negotiated version. If §5's option (b) or (c) (below,
-OQ-4) is chosen, does the engine's `versionNegotiated(QuicVersion)` call (already on the port,
-one-shot per `QuicTLSEngineImpl.java:718-723`: *"A Quic version has already been negotiated
-previously"* throws `IllegalStateException` on a second call) make it impossible to reuse the
-*same* engine instance for the alt-version Initial decode even transiently? This document did not
-trace far enough to answer definitively — flagged for the Step A spike (§8).
+**Concrete interop-test evidence firming up (a), added on review**: the IETF QUIC interoperability
+suite (`quic-interop/quic-interop-runner`, `quic.md`, the "KeyUpdate" test case) is documented as
+`keyupdate, client only` — i.e. it applies only when kwik is acting as the *client*, not the server —
+and its own description states: *"The client is expected to make sure that a key update happens
+early in the connection (during the first MB transferred)"* and, on which side may initiate it,
+*"It doesn't matter which peer actually initiated the update."* (source: the quic-interop-runner
+project's `quic.md` test-case descriptions, found via web search, not previously cited in this
+document.) Since this test only requires *a* key update to occur, from *either* side, during the
+connection — and per §2.2 above the engine autonomously initiates rollovers on its own
+confidentiality-limit heuristic regardless of whether kwik ever calls `updateKeys()` — a client-side
+key update satisfying this test case will occur whether or not kwik's own `updateKeys()` method
+exists. This means deleting `updateKeys()` is very likely safe with respect to *this specific*
+interop check. It does not rule out some other conformance suite or advanced-caller use case wanting
+on-demand key update, which is why this remains a recommendation for board sign-off rather than a
+foregone conclusion, but it removes the most obvious interop-suite objection to option (a).
 
-**OQ-3 (MEDIUM).** §1.4: the client-side version-negotiation branch
-(`ClientRolePacketParser.getAead:62-68`) constructs its throwaway `ConnectionSecrets` with
-`Role.Client` unconditionally and a `NullLogger` — worth confirming during implementation whether
-the eventual throwaway-port replacement (if that's the chosen §5 option) needs the same
-`Role`/logging treatment, or whether the port's client/server factory split (`forClient`/
-`forServer`, `QuicTlsPortImpl.java:78-93`) changes what's cheap to construct here.
+**OQ-2 (MEDIUM — now moot, superseded by OQ-4's resolution).** §1.4/§5: compatible version
+negotiation (`ServerRolePacketParser.getAead`, the `getInitialPeerSecretsForVersion` path) needs
+Initial secrets for a *second* QUIC version concurrently with the primary connection's negotiated
+version. This question was originally framed as "if §5's option (b) or (c) is chosen, does the
+engine's `versionNegotiated(QuicVersion)` one-shot `IllegalStateException`
+(`QuicTLSEngineImpl.java:718-723`) block reusing the same engine instance for the alt-version Initial
+decode?" — **that framing no longer applies**: §5.3/OQ-4 resolves this call site to option (a),
+narrow HKDF-only retention, which never calls `versionNegotiated(...)` or touches the port for
+Initial-only work at all (§5.2, site 2). Left here for traceability of the original question, not
+because it still needs board time.
 
-**OQ-4 (HIGH — this is the central open design question of this whole document, §5).** Three
-concrete options for the Initial-key-multiplicity gap, no default recommended here because the
-trade-off is genuinely close and touches things outside this document's read (server accept-loop
-threading model, whether `SSLContext` is cheaply available at `ServerConnectorImpl`/
-`ServerConnectionCandidate` construction time):
+**OQ-3 (MEDIUM — now moot, superseded by OQ-4's resolution).** §1.4: the client-side
+version-negotiation branch (`ClientRolePacketParser.getAead:62-68`) constructs its throwaway
+`ConnectionSecrets` with `Role.Client` unconditionally and a `NullLogger`. This was originally about
+whether a future throwaway-*port* replacement would need the same `Role`/logging treatment — **moot
+under §5.3/OQ-4's resolution**, since this call site keeps constructing a throwaway `ConnectionSecrets`
+exactly as it does today (option (a)), never a port/engine instance, so there is no port
+client/server factory split to reconcile here. Left for traceability.
+
+**OQ-4 (HIGH — resolved to a concrete per-site recommendation below; still needs board/Peter
+sign-off, not a unilaterally final decision).** §5 laid out three options for the
+Initial-key-multiplicity gap without picking one. A follow-up review re-examined each of the three
+call sites individually against the question "does this site ever need two live Initial key sets at
+once, or is derive-then-discard always enough" — full evidence in §5.2 — and that evidence converges
+on a single answer applying to **all three sites, not a per-site split**:
+
   - **(a) Narrow HKDF-only Initial-key retention.** Keep a reduced `ConnectionSecrets` (Initial-level
     derivation only) alive specifically for the three call sites in §5, on the grounds that Initial
     secrets are RFC-9001-public-value-derived and therefore don't reopen the "raw secrets never
@@ -671,19 +911,73 @@ threading model, whether `SSLContext` is cheaply available at `ServerConnectorIm
   - **(b) Throwaway engine/port instances per use case.** Construct a full (or as-minimal-as-possible)
     `QuicTlsPort` for each of the three call sites, matching the "everything through the port, no
     exceptions" reading of §3.1/§3.2. Needs `SSLContext` plumbed into two classes that don't have it
-    today, and needs Step A's spike to confirm engine construction is cheap enough for
-    `ServerConnectorImpl`'s single-threaded hot path.
+    today, and pays real per-call engine-construction cost on the server's accept-path hot path.
   - **(c) A dedicated "Initial-only" port/engine held once per `ServerConnector`/connection-candidate
-    stage (not per packet).** A middle ground: one long-lived engine instance reused across
-    candidates/refusals (if the single-Initial-key-slot finding in §5 doesn't actually block reuse
-    across *different* DCIDs when each call is `deriveInitialKeys` immediately before use, and
-    nothing concurrent reads stale state) — cheaper than (b) per-call, still "through the port."
-    Needs the Step A spike to know whether this is even safe (single-slot-replace semantics may make
-    this fine for a single-threaded receive loop specifically, since there's no concurrent reader of
-    the stale key).
+    stage, shared/reused across calls.** Cheaper than (b) per-call, still "through the port" —
+    *if* it's actually safe to reuse.
 
-  This document recommends running Step A's spike before picking one, but leans towards (a) or (c)
-  over (b) on cost grounds — final call is for the board, not this document.
+  **Resolution, with the evidence from §5.2 behind each part:**
+
+  1. **Site 1 (Retry dual retention) rules out (c) outright, and makes (b) pointlessly expensive.**
+     §5.2.1 confirmed this site needs the *old* and *new* Initial key sets both live, with **no
+     bound on how long** — a single shared engine slot (c) cannot represent two live key sets by
+     construction (§5.1's confirmed single-slot collision), and even (b)'s "one throwaway engine
+     per use" doesn't fit cleanly here either, because what's actually needed is closer to "keep the
+     *old* engine object around indefinitely, unmutated, while a second one holds the new keys" —
+     which is functionally two long-lived objects, not one throwaway one. (a) already *is* exactly
+     that shape (two independent, cheap `Aead` objects, no shared mutable state), at a fraction of
+     the construction cost of keeping full engine/`SSLContext` machinery alive indefinitely for
+     material that carries no confidentiality requirement in the first place.
+  2. **Site 2 (compatible version negotiation) also rules out (c), and makes (b) unnecessary rather
+     than merely expensive.** §5.2.2 found — contrary to this document's own initial working
+     hypothesis — that this site *also* needs old-version and new-version Initial keys concurrently
+     usable, per RFC 9369's explicit "MUST NOT discard" text quoted directly in
+     `ServerRolePacketParser.getAead`'s own comment. (c) is unsafe for the same reason as site 1 if
+     the shared engine's slot is the *primary* connection's own Initial keyspace (deriving the
+     alt-version secret would destroy the primary's live Initial keys). But unlike site 1, this site
+     doesn't need *persisted* dual state at all — `getInitialPeerSecretsForVersion` is already a
+     pure, stateless, side-effect-free recomputation from public inputs (DCID + version), called
+     fresh on every packet. (a)'s existing code *is* this mechanism, at zero marginal cost; (b)'s
+     full throwaway `QuicTlsPort`+`SSLContext` construction per stray old-version packet buys
+     nothing this site needs and isn't already getting from (a).
+  3. **Site 3 (pre-connection candidates/refusals) makes (c) actively unsafe, not just costly, and
+     makes (a) the only option that needs no new synchronization.** §5.2.3 found this is **not** a
+     single-threaded hot path — `ServerConnectionCandidate.parseInitialPacket` runs on
+     `context.getSharedServerExecutor()`, a shared pool of up to 10 threads, with only
+     per-candidate (not global) serialization, specifically so the server's accept path can process
+     multiple prospective connections in parallel; `ServerConnectorImpl.sendConnectionRefused` runs
+     concurrently with all of those on the dedicated receive-loop thread. A shared single engine (c)
+     would need a **new** lock added around every derive-then-use on this path, serializing exactly
+     the traffic the thread pool exists to parallelize — a plausible DoS-amplification point under
+     an Initial-packet flood, not merely a style concern, and a correctness patch for a hazard that
+     does not exist today (today's per-call `ConnectionSecrets` construction has no shared mutable
+     state at all). (b) avoids the shared-state hazard (each call gets its own object, trivially
+     thread-safe) but still requires plumbing `SSLContext` into two classes that don't have it today,
+     for no benefit over (a) once Initial secrets' non-confidential nature is accounted for — (a)'s
+     per-call `ConnectionSecrets`+`Aead` construction is *already* trivially safe across the worker
+     pool (no shared state, hence nothing to lock), with none of (b)'s `SSLContext`-plumbing cost.
+
+  **Concrete recommendation: option (a) — narrow, permanent, documented HKDF-only Initial-key
+  retention — for all three call sites, uniformly, not a per-site split.** This is a stronger,
+  simpler conclusion than this document's own earlier framing (which treated the choice as
+  genuinely close, §5's prior text) and stronger than the follow-up review's own working hypothesis
+  (which expected a per-site split between (a) and (c)); the evidence instead shows (c) is
+  structurally wrong for site 1, unsafe for sites 2 and 3 without new locking, and (b) is safe but
+  strictly dominated by (a) at every site once Initial secrets' public, non-confidential,
+  statelessly-re-derivable nature is taken into account. Practically: keep `ConnectionSecrets` (in a
+  form reduced to Initial-level derivation only — the `computeInitialSecret`/`createKeys(Initial,
+  ...)` path, `at.favre.lib.hkdf` and all, per §6.1) as a deliberate, narrow, permanently-documented
+  exception to "everything else goes through the port," scoped strictly to
+  `EncryptionLevel.Initial`/`KeySpace.INITIAL`, used at exactly the three call sites in §5.2 and
+  nowhere else. **Confidence: high** on the evidence itself (every claim above is a direct code
+  citation, not inference); the recommendation is nonetheless presented for board/Peter sign-off,
+  not as unilaterally decided, because "make this the one permanent bypass of the port boundary" is
+  a policy call about the fork's own architecture, not a fact this document can settle by itself.
+  This also resolves §6.1's conditional framing of `at.favre.lib.hkdf`'s droppability
+  (**retained**, Initial-only, per the above — not dropped) and OQ-2's question about
+  `versionNegotiated(...)`'s one-shot `IllegalStateException` (**moot** — site 2 never calls that
+  path on a shared/primary engine under this recommendation, since it never touches the port at all
+  for Initial-only work).
 
 **OQ-5 (LOW-MEDIUM).** §7.1's WARN-adjacent risk this document surfaced (§9, "what could make it
 harder"): does kwik track its own AEAD confidentiality/integrity limits anywhere outside the
@@ -718,7 +1012,41 @@ this document is making, so a future SOW revision can fold them in:
 4. Kwik's public `updateKeys()` API has no engine-side equivalent at all (self-initiated key update
    is engine-autonomous, not caller-triggerable) — this is a capability-loss finding stronger than
    the SOW's WARN anticipated, and needs an explicit decision (§2.4, OQ-1).
-5. `at.favre.lib.hkdf`'s droppability is conditional on the §5/OQ-4 decision, not unconditional as
-   the SOW's "likely drops" phrasing implies (§6.1).
+5. `at.favre.lib.hkdf` is **retained**, scoped to Initial-only, per §5.3/OQ-4's resolved
+   recommendation — not the unconditional "likely drops" the SOW's §3.2 phrasing implies (§6.1).
 6. `io.whitfin.siphash` staying is now independently confirmed by a repo-wide grep and a full read
    of its sole consumer, not merely restated (§6.2).
+
+**Corrections added in the follow-up review round (this revision):**
+
+7. §2.2's key-update-trigger gating was imprecise: the engine's self-initiated-rollover check
+   (`initiateKeyUpdate`/`usedByBothEndpoints()`) tests only whether a packet was successfully
+   encrypted/decrypted in each direction under current keys, not specifically whether one was
+   *acknowledged* in the current phase (RFC 9001 §6.1's literal text) — practically inert given the
+   80%-confidentiality-limit trigger, but described precisely now rather than asserted as literal
+   ack-gating (§2.2).
+8. Old-key retention across a key-phase rollover is a **net correctness improvement** this rewrite
+   delivers, not a neutral trade: kwik's current `KeyUpdateSupport.confirmKeyUpdateIfInProgress()`
+   retains zero old keys (a live RFC 9001 §6.5 gap today), while the engine's `KeySeries.old` +
+   `canUseOldDecryptKey` correctly retains one prior generation (§2.2.1).
+9. OQ-1's "recommend deleting `updateKeys()`" disposition now cites concrete evidence: the IETF
+   `quic-interop-runner`'s `keyupdate` test case is client-only and, per its own description,
+   indifferent to which peer initiates the update — found via web search of the project's `quic.md`
+   (§10, OQ-1).
+10. §8's staged breakdown had a real circularity bug: Step C deleted `KeyUpdateSupport.java` while
+    its sole construction site (`ConnectionSecrets.createKeys()`) was left for Step D, which would
+    have broken the build between steps. Fixed by pulling the one-call-site unwrap into Step C,
+    keeping Step D's scope otherwise unchanged (§8, Step C).
+11. §7.1's blast-radius list omitted that `RetryPacket.java` and `VersionNegotiationPacket.java` both
+    override the `QuicPacket` abstract methods this rewrite re-signatures (`parse`/
+    `generatePacketBytes`), even though neither file's logic touches the `Aead` parameter at all —
+    both need a mechanical, signature-only edit, called out explicitly so it isn't mistaken for
+    real logic work (§7.1).
+12. §8's Step B understated its §3.3 dependency: reaching `keysAvailable(ONE_RTT)` requires driving
+    a real (if minimal) handshake through `consumeHandshakeBytes`/`getHandshakeBytes`, not just
+    constructing the trivial `QuicOneRttContext` stub the earlier phrasing implied (§8, Step B).
+13. §5's Initial-key-multiplicity gap is now **resolved**, not merely identified: per-site analysis
+    (§5.2) shows the single-slot collision (confirmed empirically, §5.1, not just structurally)
+    rules out a shared engine for all three call sites, converging on option (a) — narrow HKDF-only
+    retention — uniformly, contrary to this document's own earlier framing that treated the
+    trade-off as genuinely close (§5.3, OQ-4).
