@@ -8,6 +8,19 @@ scope document for board review before any implementation agent touches
 citations, exact method signatures actually read from source (not paraphrased), explicit open
 questions, no hand-waving.
 
+**Sign-off (2026-07-20): §5.3/OQ-4's recommendation is APPROVED.** Peter has explicitly signed off
+on option (a) — narrow, permanent HKDF-only Initial-key retention, applied uniformly to all three
+call sites (Retry dual retention, compatible version negotiation, pre-connection candidate/refusal
+packets) — **as recommended, with no changes**, and has directed that implementation proceed. See
+§10/OQ-4 for the full resolution text this sign-off approves. This closes Step A's sign-off gate
+(§8); what remained of Step A after that — finalizing the `EncryptionLevel`↔`KeySpace` mapping and
+the reduced `ConnectionSecrets` shape into an implementation-ready spec — is done below (§4, new
+§6.1.1) as of this revision. **One correction surfaced while finalizing that spec: the reduced
+`ConnectionSecrets` shape cannot be strictly "Initial-only" as earlier drafts of this document
+phrased it — it must also retain 0-RTT (`EncryptionLevel.ZeroRTT`) secret derivation, or this
+rewrite silently breaks kwik's live, tested 0-RTT support. See §6.1.1 for the finding and the
+resolved shape; §11 items 14-16 for the corrections this drives into §4/§6.1/§7.1/§8/§9.**
+
 Everything below was produced by reading, in full: `SOW-Kwik-JSSE-QUIC-TLS-Transport.md`;
 `core/src/main/java/tech/kwik/core/tls/QuicTlsPort.java` and `QuicTlsPortImpl.java`;
 `core/src/main/java/tech/kwik/core/crypto/ConnectionSecrets.java`, `CryptoStream.java`,
@@ -27,6 +40,20 @@ says — the DirtyChai engine implementation source, **read-only, per this task'
 safeguard** (`jdk.internal.net.quic.QuicTLSEngine.java`, `QuicOneRttContext.java`, and
 `sun.security.ssl.QuicTLSEngineImpl.java` / `QuicKeyManager.java`, all under
 `/home/user/GitHub/DirtyChai/src/java.base/share/classes/`). No DirtyChai file was written to.
+
+**Additionally read in full for this finalization pass (Step A closeout, 2026-07-20)**, specifically
+to answer "what exactly survives, precisely" rather than restate earlier summaries:
+`core/src/main/java/tech/kwik/core/common/EncryptionLevel.java`; `ConnectionSecrets.java` and
+`Aead.java` (both re-read in full, not partially); `MissingKeysException.java` (44 lines, in full);
+`QuicTlsPort.java`/`QuicTlsPortImpl.java` (re-read for existing static-method conventions);
+`core/src/main/java/tech/kwik/core/packet/ZeroRttPacket.java` (in full); `core/build.gradle` and
+`core/src/main/java/module-info.java` (for the `jdk.internal.net.quic` qualified-export/module-boundary
+question behind §4.1); the full bodies of `ClientRolePacketParser.getAead`/
+`ServerRolePacketParser.getAead` and `SenderImpl.send` (not just the excerpts the original document
+cited); and targeted greps confirming every caller of `ConnectionSecrets.computeInitialKeys`/
+`computeEarlySecrets`/`selectedCipherSuite` across the full `core` main source tree. No production
+code was written or modified by this pass either — same "SCOPE ONLY" status as the rest of this
+document.
 
 ---
 
@@ -343,10 +370,23 @@ does not expose. See open question OQ-1.
 
 ## 3. Call-site re-pointing plan
 
+**Scope correction, finalized in §6.1.1/§6.1.2/§10 below (read this before the table): the table
+below applies to `EncryptionLevel.Handshake` and `EncryptionLevel.App` only.** Earlier drafts of
+this document (and this section's own original framing) left it looking as if this six-item swap
+applied uniformly across every level `QuicPacket` protects, with `Initial` narrowed down to a
+handful of edge cases later in §5. That's not the finalized design: **`Initial` and `ZeroRTT` both
+stay on today's `Aead`-taking path, permanently, for every use — not just the three §5.2 edge
+cases** — see §6.1.1 (why `ZeroRTT` must) and §6.1.2/§10's correction (why `Initial`'s exclusion
+isn't limited to the three named call sites either). So `InitialPacket` and `ZeroRttPacket` keep
+calling `QuicPacket`'s existing `Aead`-taking `parsePacketNumberAndPayload`/
+`protectPacketNumberAndPayload` overload unchanged; only `HandshakePacket` and `ShortHeaderPacket`
+(App/1-RTT) move to the table below.
+
 All six items below replace kwik's two-step `aeadEncrypt`+`createHeaderProtectionMask` /
 `aeadDecrypt`+(unmask first) pattern with the port's two-mandatory-calls-per-direction pattern,
 confirmed against `QuicTlsPort.java`'s actual signatures (not assumed ones) and cross-checked
-against `QuicTlsPortImpl.java`'s delegation (both read in full, §3.1 area above).
+against `QuicTlsPortImpl.java`'s delegation (both read in full, §3.1 area above), **for the
+Handshake/App levels only, per the correction above.**
 
 | Today (`QuicPacket.java`) | Replaces with (`QuicTlsPort`) | Order |
 |---|---|---|
@@ -375,11 +415,17 @@ header → decrypt), just swapping `aead.createHeaderProtectionMask`/`aead.aeadD
 `port.computeHeaderProtectionMask`/`port.decryptPacket`, and dropping the nonce-construction and
 `checkKeyPhase` code (§2.3).
 
-**What `ClientRolePacketParser`/`ServerRolePacketParser` change to**: their `getAead(...)` methods'
-`EncryptionLevel`-keyed `Aead` lookup is replaced by an `EncryptionLevel → KeySpace` mapping (§4)
-used to select which `KeySpace` argument to pass into the port calls above — the parsers no longer
-"get an object," they translate an enum. The two version-negotiation-adjacent branches (§1.4) need
-their own resolution — see OQ-2/OQ-3 (§5, §9).
+**What `ClientRolePacketParser`/`ServerRolePacketParser` change to — finalized, corrected from
+earlier drafts**: their `getAead(...)` methods become a **branch**, not a uniform translation. For
+`Handshake`/`App`, the `EncryptionLevel`-keyed `Aead` lookup is replaced by
+`QuicTlsPort.toKeySpace(level)` (§4.1) used to select the `KeySpace` argument for the port calls
+above — the parser no longer "gets an object," it translates an enum and calls the port. For
+`Initial`/`ZeroRTT` (both the primary lookup and the version-negotiation-adjacent branches, §1.4),
+the existing `connectionSecrets.getPeerAead(level)`/-equivalent `Aead` lookup is **unchanged** —
+see §6.1.2's call-site confirmation and §6.1.1/§10's corrected scope above. OQ-2/OQ-3 (§10) are
+already resolved as moot for exactly this reason — both were about what a *port*-based replacement
+for the version-negotiation branches would need, and neither branch becomes port-based under the
+finalized design.
 
 ---
 
@@ -392,17 +438,96 @@ one name-shape mismatch and one exclusion:
 
 | `EncryptionLevel` | `KeySpace` | Note |
 |---|---|---|
-| `Initial` | `INITIAL` | 1:1, but see §5 — a single engine's `INITIAL` key-space is a **single slot**, and kwik sometimes needs two Initial key sets alive at once. |
-| `Handshake` | `HANDSHAKE` | 1:1. |
-| `App` | `ONE_RTT` | Name differs; semantics identical (RFC 9001's "Application Data (1-RTT) Keys", both enums' own doc comments cite the same RFC language). |
-| `ZeroRTT` | `ZERO_RTT` | **Excluded by construction per SOW §3.5 (STD-010 §6.2)** — this document does not scope 0-RTT re-pointing; `ZeroRttPacket.java` is out of scope here (§3.5 is a separate work item). |
+| `Initial` | `INITIAL` | 1:1 in principle, but **finalized as never actually invoked by re-pointed kwik code** (§6.1.1/§6.1.2/§10-OQ-4, sign-off recorded) — a single engine's `INITIAL` key-space is a **single slot** (§5), and `EncryptionLevel.Initial` stays permanently on the `ConnectionSecrets`/`Aead`/HKDF path instead, for every use, not only the three §5.2 edge cases. Included in this mapping table for completeness/documentation purposes, not because any call site is expected to call `toKeySpace(Initial)` (§4.1's spec still supports it correctly if ever needed — it's `ZeroRTT` specifically that throws). |
+| `Handshake` | `HANDSHAKE` | 1:1. Moves to the port (§3). |
+| `App` | `ONE_RTT` | Name differs; semantics identical (RFC 9001's "Application Data (1-RTT) Keys", both enums' own doc comments cite the same RFC language). Moves to the port (§3). |
+| `ZeroRTT` | `ZERO_RTT` | **Excluded by construction per SOW §3.5 (STD-010 §6.2)** — this document does not scope 0-RTT re-pointing; `ZeroRttPacket.java` is out of scope here (§3.5 is a separate work item). **`toKeySpace(ZeroRTT)` throws `IllegalArgumentException` (§4.1)** — unlike `Initial`, this is a genuine "never call this" case, not just "no current caller." |
 | *(none)* | `RETRY` | kwik's `RetryPacket` does not use `ConnectionSecrets`/`Aead` at all — it computes its own static-key AEAD integrity tag directly with `javax.crypto.Cipher` (`RetryPacket.java:242-`, read in part), independent of TLS secrets entirely (RFC 9001 §5.8's fixed public key). The port's `signRetryPacket`/`verifyRetryPacket` (already present, `QuicTlsPort.java:246-255`) are the eventual replacement, but the SOW places that under §3.3, not §3.2, and this document does not scope it further — noted here only so the key-space table is complete. |
 
 Kwik's `EncryptionLevel` enum can **stay** (it's referenced far too widely — `PnSpace` mapping,
-logging, `CryptoStream`'s per-level construction, etc. — to be worth deleting), and should simply
-gain a translation function to `QuicTLSEngine.KeySpace` used at the `PacketParser`/`SenderImpl` call
-sites identified in §1.4/§1.6. This keeps the `QuicTlsPort` import boundary narrow (per §3.1's own
-design goal) — translation happens once, at the seam, not scattered.
+logging, `CryptoStream`'s per-level construction, etc. — to be worth deleting), and gains a
+translation function to `QuicTLSEngine.KeySpace` used at the `PacketParser`/`SenderImpl` call sites
+identified in §1.4/§1.6. Translation happens once, at the seam, not scattered.
+
+### 4.1 Implementation-ready spec: where the mapping function lives, and why not on `EncryptionLevel`
+
+**Correction to this document's own earlier phrasing.** The text above used to say the mapping
+"should simply gain a translation function" on `EncryptionLevel` itself, by analogy with the
+existing `relatedPnSpace()` instance method (`EncryptionLevel.java:39-47`, read again for this
+finalization pass — a plain `switch` returning another kwik-local enum). That analogy does not
+carry over to `KeySpace`, for a reason specific to this codebase's module boundaries, checked
+concretely rather than assumed:
+
+- `EncryptionLevel` lives in `tech.kwik.core.common`, which `module-info.java` exports
+  unconditionally to `tech.kwik.qlog` (`exports tech.kwik.core.common to tech.kwik.qlog;`) — and
+  `qlog`'s own source (`ConnectionQLog.java`, confirmed by grep) genuinely consumes
+  `EncryptionLevel` today.
+- `jdk.internal.net.quic` (which declares `QuicTLSEngine.KeySpace`) is a **qualified export** in
+  the DirtyChai `java.base` module descriptor, and per `core/build.gradle`'s own comment (read in
+  full for this check) the qualified-export target list names exactly two modules: `java.net.http`
+  and `tech.kwik.core`. `tech.kwik.qlog` is not on that list and has no other route to it.
+- `tech.kwik.core` main sources *can* reference `jdk.internal.net.quic` types without any extra
+  compiler flag (the module-level qualified export covers the whole `tech.kwik.core` module, not a
+  narrower package inside it), so putting `toKeySpace()` on `EncryptionLevel` would compile today.
+  But it would put a `jdk.internal.net.quic`-typed public method on a class exported straight into a
+  module (`qlog`) that cannot resolve that type — a landmine for any future `qlog` code path that
+  starts using it (`IllegalAccessError`/module-resolution failure at that point, not now), and a
+  direct contradiction of `QuicTlsPort`'s own javadoc goal of being the fork's "single point of
+  contact" with `jdk.internal.net.quic` (`QuicTlsPort.java:40-45`).
+
+**Resolved placement: a static method on `QuicTlsPort` itself** (`tech.kwik.core.tls` package — not
+exported to `qlog` per `module-info.java`, and already the file every `KeySpace`-typed call in this
+rewrite has to import regardless, so this adds no new import burden at the `PacketParser`/
+`SenderImpl` call sites). This matches the existing convention of small static translation/predicate
+methods living beside the type they're most relevant to in this package
+(`QuicTlsPortImpl.isQuicCompatible(SSLContext)`, `QuicTransportParametersExtension.isCodepoint(...)`
+— both static, both package-`tls`-local, both read for this comparison) rather than kwik's other
+convention of an instance method on the source enum (`relatedPnSpace()`), which doesn't apply here
+for the module-boundary reason above.
+
+**Exact signature, implementation-ready:**
+
+```java
+// tech.kwik.core.tls.QuicTlsPort
+
+/**
+ * Translates a kwik {@link EncryptionLevel} to the port's {@link QuicTLSEngine.KeySpace}, for use
+ * at the {@code PacketParser}/{@code SenderImpl} call sites that select which key space to pass
+ * into the packet-protection methods below (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§4).
+ *
+ * <p>{@link EncryptionLevel#ZeroRTT} has no mapping: per SOW §3.5 (STD-010 §6.2), 0-RTT re-pointing
+ * to this port is a separate, not-yet-scoped work item, and per §6.1.1 of the ADVICE doc above,
+ * {@code ZeroRttPacket} continues to use the legacy {@code ConnectionSecrets}/{@code Aead}
+ * path for the duration of this rewrite, never this port. Callers MUST branch on
+ * {@code EncryptionLevel == ZeroRTT} themselves and never reach this method for it; calling it
+ * with {@code ZeroRTT} is a caller bug, hence an unchecked exception, not a checked one.
+ *
+ * <p>{@link QuicTLSEngine.KeySpace#RETRY} has no corresponding {@code EncryptionLevel} at all
+ * (RFC 9001 §5.8's Retry integrity tag is not TLS-secret-derived) and is therefore not a case this
+ * method can be asked to produce — there is no {@code EncryptionLevel} value that maps to it.
+ * {@code RetryPacket} uses {@link #signRetryPacket}/{@link #verifyRetryPacket} directly instead.
+ *
+ * @throws IllegalArgumentException if {@code level} is {@link EncryptionLevel#ZeroRTT}
+ */
+static QuicTLSEngine.KeySpace toKeySpace(EncryptionLevel level) {
+    switch (level) {
+        case Initial:   return QuicTLSEngine.KeySpace.INITIAL;
+        case Handshake: return QuicTLSEngine.KeySpace.HANDSHAKE;
+        case App:       return QuicTLSEngine.KeySpace.ONE_RTT;
+        case ZeroRTT:
+            throw new IllegalArgumentException(
+                    "ZeroRTT has no KeySpace mapping: 0-RTT is not re-pointed to the port by this " +
+                    "rewrite (SOW §3.5); ZeroRttPacket must use the legacy Aead path, not this method.");
+        default:
+            throw new IllegalStateException("unreachable: " + level); // exhaustive switch guard
+    }
+}
+```
+
+This requires no import of `EncryptionLevel` into `QuicTlsPort.java` beyond what's already implied
+by the method signature (`tech.kwik.core.common.EncryptionLevel` — one new import, `common` is
+already a stable, low-churn package). No reverse (`KeySpace → EncryptionLevel`) direction is
+needed anywhere in the call-site plan (§3) and none is specified.
 
 ---
 
@@ -565,7 +690,7 @@ concrete recommendation.
 
 ## 6. Dependency cleanup — verified, not assumed
 
-### 6.1 `at.favre.lib.hkdf` — retained, Initial-only, per §5.3/OQ-4's resolved recommendation
+### 6.1 `at.favre.lib.hkdf` — retained, scoped to Initial + 0-RTT (§6.1.1), per §5.3/OQ-4's resolved recommendation
 
 Repo-wide grep (`--include=*.java .` from the repo root, plus `build.gradle`/`module-info.java`
 greps) confirms **exactly five source files** use `at.favre.lib.hkdf`, and no others exist anywhere
@@ -574,19 +699,215 @@ in the reactor (`qlog`, `cli`, `interop`, `samples`, `h09` all clean):
 `core/build.gradle:49-50` declares it; `module-info.java:3` requires it
 (`requires at.favre.lib.hkdf;`).
 
-Four of the five (`BaseAeadImpl.java`, `ChaCha20.java`, `Aes256Gcm.java`, and the Handshake/App-level
-paths of `ConnectionSecrets.java`) are deleted/gutted by this rewrite, as before. **Updated per
-§5.3/OQ-4's resolved recommendation (option (a), uniformly, for all three Initial-key-multiplicity
-call sites — no longer conditional on a future board choice among three options, since the evidence
-in §5.2 converges on one answer): `ConnectionSecrets` survives in reduced, Initial-only form, and so
-does the dependency itself, scoped strictly to Initial-level HKDF derivation.** `Aes128Gcm.java`
-specifically also survives (it's the concrete `Aead` implementation `createKeys(Initial, ...)` and
-`getInitialPeerSecretsForVersion` construct) — the other three cipher-suite classes
-(`Aes256Gcm`/`ChaCha20`, plus `BaseAeadImpl`'s Handshake/App-level machinery) do not, since Initial
-secrets are always `TLS_AES_128_GCM_SHA256` per RFC 9001 §5.2, never cipher-suite-negotiated. This
+The Handshake/App-level paths of `ConnectionSecrets.java` (`computeHandshakeSecrets`,
+`computeApplicationSecrets`) are deleted by this rewrite, as before. **Updated per §5.3/OQ-4's
+resolved recommendation (option (a), uniformly, for all three Initial-key-multiplicity call sites —
+no longer conditional on a future board choice among three options, since the evidence in §5.2
+converges on one answer): `ConnectionSecrets` survives in reduced form, and so does the dependency
+itself, scoped to Initial- and (per §6.1.1 below — a correction to this section's earlier framing)
+0-RTT-level HKDF derivation.** `Aes128Gcm.java` specifically also survives (it's the concrete `Aead`
+implementation `createKeys(Initial, ...)` and `getInitialPeerSecretsForVersion` construct). This
 finalizes what the earlier draft of this document left conditional on a future §5 decision — the
 "likely drops" framing in the SOW's §3.2 "Dependency cleanup" bullet should be read as **"retained,
-Initial-only, one class + the dependency,"** not as dropped, pending only the OQ-4 sign-off in §5.3.
+scoped to the pre-Handshake levels, per §6.1.1,"** not as dropped, pending only the OQ-4 sign-off.
+
+**Correction, superseding this section's original "Initial-only" framing for the other three
+cipher-suite classes** (`Aes256Gcm.java`, `ChaCha20.java`, `BaseAeadImpl.java`): earlier drafts of
+this section said these three "do not survive, since Initial secrets are always
+`TLS_AES_128_GCM_SHA256`... never cipher-suite-negotiated" — **that's true of Initial specifically,
+but the reduced class also has to keep 0-RTT working (§6.1.1), and 0-RTT *is*
+cipher-suite-negotiated exactly like Handshake/App were. All three classes survive.** See §6.1.1 for
+the full finding and the corrected file-survival list.
+
+### 6.1.1 CORRECTION (found while finalizing Step A's spec): "Initial-only" breaks live 0-RTT support
+
+**This is a real contradiction between this document's own findings, not a hypothetical edge case —
+found by re-reading `ConnectionSecrets.java` in full specifically to answer "what exactly survives,"
+per this finalization pass's own brief, rather than restating the earlier drafts' summary.**
+
+- **0-RTT is live, production, tested code today, not scaffolding.** Repo-wide grep confirms
+  `connectionSecrets.computeEarlySecrets(tlsEngine, cipher, quicVersion.getVersion())` is called from
+  `QuicClientConnectionImpl.java:585` and `connectionSecrets.computeEarlySecrets(tlsEngine,
+  tlsEngine.getSelectedCipher(), originalVersion)` from `ServerConnectionImpl.java:282` — both real
+  handshake-path call sites, not test-only code. `ZeroRttPacket.java` (read in full) extends
+  `LongHeaderPacket` directly and **overrides none** of `generatePacketBytes`/`parse`/the
+  protect-unprotect methods — unlike `RetryPacket`/`VersionNegotiationPacket` (§7.1's correction),
+  it funnels through `QuicPacket`'s shared `parsePacketNumberAndPayload`/`protectPacketNumberAndPayload`
+  methods exactly like `InitialPacket`/`HandshakePacket`/`ShortHeaderPacket` do, with a real,
+  genuinely-encrypting `Aead`. `ZeroRttPacketTest.java` exists and is one of the 7 files §7.2 already
+  lists as a `CryptoTestUtils.createKeys()` consumer.
+- **`computeEarlySecrets(TrafficSecrets, CipherSuite, Version)` (`ConnectionSecrets.java:163-167`)
+  calls the same private `createKeys(...)` multiplexer Handshake/App use** (`:169-207`), which
+  cipher-suite-selects between `Aes128Gcm`/`Aes256Gcm`/`ChaCha20` via a `TriFunction` factory
+  (`:173-184`) — 0-RTT is negotiated via the resumed/PSK cipher suite, not hardcoded to
+  `TLS_AES_128_GCM_SHA256` the way Initial is (RFC 9001 §5.2 vs. §4.6's early-data-secret text).
+  **If `ConnectionSecrets` is reduced to strictly Initial-only as earlier drafts of §4/§6.1/§7.1
+  phrased it — deleting `computeEarlySecrets`, `Aes256Gcm`, `ChaCha20`, and the cipher-suite-selecting
+  half of `createKeys`/`BaseAeadImpl` — both call sites above stop compiling, and even if patched to
+  compile, 0-RTT silently loses the ability to negotiate any cipher suite but
+  `TLS_AES_128_GCM_SHA256`.** This is exactly the kind of finding this finalization pass was asked to
+  surface plainly rather than paper over, per this task's own brief.
+- **Why §4's `ZeroRTT → (excluded)` framing didn't already catch this**: §4's table is about the
+  `EncryptionLevel → KeySpace` *mapping function* specifically — and it's correct that `ZeroRTT` has
+  no `KeySpace` mapping and must never reach the port (SOW §3.5 defers 0-RTT re-pointing to a
+  separate, unscoped work item). What §4's exclusion does **not** mean, and what earlier drafts of
+  this document conflated it with, is "therefore `ConnectionSecrets`'s 0-RTT machinery can be deleted
+  too." Those are independent questions: *whether 0-RTT talks to the port* (no, per §3.5) is separate
+  from *whether 0-RTT keeps a working legacy `Aead` path to talk to instead* (yes — it has to, because
+  nothing else provides one, and §3.5 hasn't happened yet).
+
+**Resolved shape: `ConnectionSecrets` is reduced to Initial + 0-RTT (i.e. "pre-Handshake") level
+derivation, not "Initial-only."** Concretely, this changes the file-survival list from §6.1/§7.1's
+earlier framing:
+
+| File | Earlier framing | Corrected |
+|---|---|---|
+| `Aes128Gcm.java` | retained (Initial) | retained (Initial + still usable for 0-RTT if that cipher suite is negotiated) |
+| `Aes256Gcm.java` | **deleted** | **retained** — 0-RTT can negotiate `TLS_AES_256_GCM_SHA384` |
+| `ChaCha20.java` | **deleted** | **retained** — 0-RTT can negotiate `TLS_CHACHA20_POLY1305_SHA256` |
+| `BaseAeadImpl.java` | **deleted** | **retained** — shared HKDF-Expand-Label base class all three `Aead` impls need; still has callers (0-RTT) after Handshake/App go |
+| `at.favre.lib.hkdf` | retained, "Initial-only" | retained, scoped to Initial + 0-RTT derivation (unchanged dependency footprint — same five files as today, per the grep above, none newly droppable) |
+
+`ConnectionSecrets`'s own reduced method list is finalized in full in §6.1.2 below (the answer to
+this ADVICE task's item 3). One further small `Aead.java` correction that falls out of this same
+re-read: `computeNextApplicationTrafficSecret()` (`Aead.java`, no default body, so every implementer
+must define it) is **not** in §2.3's enumerated list of ratchet-related *default* methods to delete,
+because it isn't a default method — but it has exactly one caller anywhere in the tree,
+`KeyUpdateSupport.computeKeyUpdate` (§2.1), and that caller is deleted in Step C. So this method is
+also dead after Step C and should be deleted from `Aead.java` and all three implementers
+(`Aes128Gcm`/`Aes256Gcm`/`ChaCha20`) at that point — a one-line addition to §2.3's deletion list, not
+a new step.
+
+### 6.1.2 Implementation-ready spec: the reduced `ConnectionSecrets` shape
+
+Full re-read of `ConnectionSecrets.java` (all 307 lines), specifically against the question "what
+exactly survives Step D," per this finalization task's brief.
+
+**Class name: unchanged (`ConnectionSecrets`) — considered a rename and rejected.** A name like
+`InitialConnectionSecrets` was the obvious candidate before §6.1.1's finding; after it, the class
+covers two encryption levels (Initial + ZeroRTT), not one, so any Initial-specific name would now be
+actively misleading, not merely imprecise. The class's real, stable invariant — "handshake-secret
+material that predates/doesn't require a fully negotiated 1-RTT connection, and therefore isn't
+subject to the port's own 'never touch raw negotiated secrets' boundary" — is captured no better by
+any shorter name than by keeping the existing one. Renaming also carries real, avoidable cost: all
+10 test files in §7.2 reference the class by name, and a rename would touch every one of them for a
+purely cosmetic gain. **Recommendation: keep the name.**
+
+**Field list:**
+
+| Field | Survives? | Notes |
+|---|---|---|
+| `quicVersion`, `ownRole`, `log` | yes, unchanged | |
+| `clientRandom` | yes, unchanged | still set via `setClientRandom`; still used by `appendToFile` if that stays wired (see below) |
+| `clientSecrets` / `serverSecrets` (`AtomicReferenceArray<Aead>`) | yes, unchanged in shape | still sized `EncryptionLevel.values().length` (4) and indexed by `.ordinal()` — **recommend NOT shrinking this to a 2-element array**, even though only `Initial`/`ZeroRTT` slots are ever populated post-rewrite. Reindexing by a new, narrower enum (or a hand-rolled 0/1 index) is exactly the kind of "looks equivalent, silently off-by-one" change that risks a subtle bug for zero benefit — `EncryptionLevel.values().length` costs 2 unused array slots, nothing more, and every existing `.ordinal()` call site (§3, the getters below) keeps working unmodified. |
+| `originalClientInitialSecret` | yes, unchanged | Retry dual retention, site 1 |
+| `originalDestinationConnectionId` | yes, unchanged | |
+| `discarded` (`AtomicBoolean[]`) | yes, unchanged | same sizing rationale as `clientSecrets`/`serverSecrets` |
+| `selectedCipherSuite` | **deleted — new finding, not in earlier drafts** | Set only inside `computeHandshakeSecrets` (`:210`); read only inside `computeApplicationSecrets` (`:230`, `createKeys(EncryptionLevel.App, selectedCipherSuite, ...)`). Both methods are deleted (Handshake/App). `computeEarlySecrets` (surviving, 0-RTT) takes its `CipherSuite` as a **method parameter**, not from this field — it never reads `selectedCipherSuite`. So this field has zero readers/writers left once Handshake/App are gone; delete it as part of Step D's `ConnectionSecrets` diff. |
+| `writeSecretsToFile`, `wiresharkSecretsFile` | **dead, but harmless to leave or delete — implementer's call, lean toward deleting** | see `appendToFile` below; these two fields exist only to support it. |
+
+**Method list:**
+
+| Method | Survives? | Notes |
+|---|---|---|
+| constructor | yes, unchanged | |
+| `computeInitialKeys(byte[])` | yes, unchanged | |
+| `recomputeInitialKeys(byte[])` | yes, unchanged | Retry dual retention, site 1 (`ServerConnectionImpl.java:485`) |
+| `recomputeInitialKeys()` (no-arg) | yes, unchanged | version-negotiation recompute, site 2 (`ServerConnectionImpl.java:635`, `QuicClientConnectionImpl.java:691`) |
+| `getInitialPeerSecretsForVersion(Version)` | yes, unchanged | site 2's stateless alt-version recompute |
+| `computeInitialSecret(Version)` (private) | yes, unchanged | |
+| `computeEarlySecrets(TrafficSecrets, CipherSuite, Version)` | **yes — corrected; earlier drafts implied this goes with Handshake/App** | 0-RTT, per §6.1.1 |
+| `createKeys(...)` (private multiplexer) | yes, narrowed | The `if (level == EncryptionLevel.App) { ...KeyUpdateSupport wrap + setPeerAead... }` branch (`:195-203`) is removed — but that removal is already correctly assigned to **Step C** by §8's existing circularity fix (Step C pulls the `createKeys()` App-branch edit forward specifically so `KeyUpdateSupport`'s deletion and its one call site are in the same diff). Nothing new to schedule here; this note just confirms the surviving `createKeys` (post-Step-C) is only ever called with `Initial`/`ZeroRTT`, so the branch's removal is safe and the method's remaining shape (cipher-suite dispatch to `Aes128Gcm`/`Aes256Gcm`/`ChaCha20`) is exactly what 0-RTT needs (§6.1.1). |
+| `computeHandshakeSecrets(...)` | **deleted** | unchanged from earlier drafts |
+| `computeApplicationSecrets(...)` | **deleted** | unchanged from earlier drafts |
+| `appendToFile(String, EncryptionLevel)` (private) | **dead once its only 2 callers are gone — new finding** | Called only from `computeHandshakeSecrets` (label `"HANDSHAKE_TRAFFIC_SECRET"`) and `computeApplicationSecrets` (label `"TRAFFIC_SECRET_0"`) — both deleted. Neither `computeInitialKeys` nor `computeEarlySecrets` ever called it (confirmed by reading both in full — no Wireshark/`SSLKEYLOGFILE`-style export exists for Initial or 0-RTT secrets today, so nothing is being taken away that worked before). **Recommendation: delete `appendToFile` and its two backing fields (`writeSecretsToFile`, `wiresharkSecretsFile`) in Step D** — this is a real, if small, capability loss (no more Wireshark secrets-file export for Handshake/App, which were the levels people actually want to decode traffic for), but it isn't a new loss caused by this rewrite's scoping choices; it falls out mechanically from Handshake/App moving to the port, and the JDK engine's own TLS stack has its own, separate `SSLKEYLOGFILE`-equivalent facility for exactly this case (standard JDK debug/keylog support), which is the natural replacement — worth one line in release notes, not a design gap this document needs to solve. |
+| `setClientRandom(byte[])` | yes, unchanged, *if* `appendToFile` is kept; dead weight (but harmless) if deleted | |
+| `getClientAead` / `getServerAead` / `getPeerAead` / `getOwnAead` | yes, unchanged | now resolve only `Initial`/`ZeroRTT` in practice, but the method bodies (`EncryptionLevel`-parameterized, `.ordinal()`-indexed) need no changes — they were never Handshake/App-specific in shape, only in what got stored |
+| `getOriginalClientInitialAead()` | yes, unchanged | site 1 |
+| `checkNotNull(Aead, EncryptionLevel)` (private) | yes, unchanged | |
+| `discardKeys(EncryptionLevel)` | yes, unchanged | |
+
+**`MissingKeysException` handling: no changes needed, at all.** Re-read in full for this
+finalization (§1.1 already flagged it as relevant; this pass checked whether its Handshake/App
+"maps onto the port's own exception types" note (§1.1) implies the *remaining* class needs new
+logic). It doesn't. `MissingKeysException` (`MissingKeysException.java`, 44 lines) is a plain,
+generic `(EncryptionLevel, Cause)` pair with no per-level branching anywhere in its own code — it was
+never Handshake/App-specific to begin with, so there's nothing in it to trim. It continues to be
+thrown by `checkNotNull` for whichever `EncryptionLevel` slot is null (now only ever `Initial` or
+`ZeroRTT` in practice) with zero modification. The "maps onto the port's exception types" note in
+§1.1 is about the **Handshake/App code that moved to the port** needing `QuicKeyUnavailableException`/
+`keysAvailable(KeySpace)` instead — it was never a statement that `MissingKeysException` itself needs
+rework, and this finalization pass confirms that reading.
+
+**Call-site confirmation (this ADVICE task's explicit ask: verify, don't assume, that these sites
+don't need changes beyond what's already true today).** Re-checked against source, all six:
+
+1. `ServerConnectionImpl.java:485` (`recomputeInitialKeys(byte[])`, Retry) — call unchanged.
+2. `ServerConnectionImpl.java:635` / `QuicClientConnectionImpl.java:691`
+   (`recomputeInitialKeys()`, version-negotiation) — call unchanged.
+3. `ServerRolePacketParser.getAead` (`:70`, `getOriginalClientInitialAead()`) and (`:93-97`,
+   `getInitialPeerSecretsForVersion`) — calls unchanged.
+4. `ClientRolePacketParser.getAead` (`:62-68`, throwaway `ConnectionSecrets` + `computeInitialKeys`)
+   — call unchanged.
+5. `ServerConnectorImpl.sendConnectionRefused` / `ServerConnectionCandidate` (throwaway
+   `ConnectionSecrets` + `computeInitialKeys`, §1.6) — calls unchanged.
+
+**Confirmed true, with one addition beyond what was already known**: none of the five call-site
+groups above need to change *at all* — §5.2's claim holds exactly as stated, and Step D's re-pointing
+work at these sites really is close to a no-op, as §9 already estimated. **The addition, and a
+second, larger correction to §5.3/OQ-4's resolution text it forces**: this finalization pass
+re-checked `ClientRolePacketParser.getAead`'s and `ServerRolePacketParser.getAead`'s **primary**
+(non-alt-version) branch too, not just the alt-version branches §1.4 already covered —
+`ClientRolePacketParser.getAead:53`, `aead = connectionSecrets.getPeerAead(packet.getEncryptionLevel())`,
+called for **every** packet level uniformly, `Initial`/`ZeroRTT`/`Handshake`/`App` alike, and
+`SenderImpl.java:421`'s `connectionSecrets.getOwnAead(packet.getEncryptionLevel())` is the same
+shape on the send side.
+
+**CORRECTION: §10/OQ-4's resolution text — "used at exactly the three call sites in §5.2 and
+nowhere else" — is imprecise, and reading it literally would lead a Step B/D implementer to a wrong
+design.** Grepping every caller of the *non*-recompute `computeInitialKeys(byte[])` (as opposed to
+`recomputeInitialKeys`, which §5.2.1 already covered) turns up two more, neither a throwaway and
+neither one of the three §5.2 sites: `QuicClientConnectionImpl.java:525`
+(`generateInitialKeys()`, called once per client connection to bootstrap the connection's own,
+ordinary Initial keys — nothing to do with Retry, version negotiation, or pre-connection candidates)
+and `ServerConnectionImpl.java:181` (same bootstrap, server side, in the constructor). **This is the
+*primary* connection's own, everyday, non-edge-case Initial-key setup** — the single most common use
+of `ConnectionSecrets`'s Initial machinery, and it was already implicit in §1.6's own words ("this
+one does correspond 1:1 to a per-connection engine/port instance and is unremarkable") but never
+stated as a 4th call site alongside the three §5.2 enumerated, nor connected explicitly to OQ-4's
+"and nowhere else" phrasing.
+
+**Resolving this precisely, since a future implementer needs zero ambiguity here**: OQ-4's actual
+recommendation — keep Initial-level protection off the port permanently, on `ConnectionSecrets`/HKDF
+— is not undermined by this correction; if anything it's reinforced, because trying to route the
+*primary* connection's own day-to-day Initial traffic through `port.deriveInitialKeys()`/
+`KeySpace.INITIAL` while *also* keeping a parallel `ConnectionSecrets`-held Initial secret alive for
+the three §5.2 edge cases would recreate exactly the "two authorities for the same key material"
+shape this whole document's WARN theme argues against — now for Initial instead of key-phase state.
+**The clean, single-authority reading, and the one this document now finalizes: `EncryptionLevel.Initial`
+is excluded from the port re-pointing *entirely*, not just for the three §5.2 concurrency-collision
+cases — every Initial-key use, primary-connection or edge-case, stays on `ConnectionSecrets`/`Aead`/
+HKDF, permanently, for the reason §5.3 already gives (Initial secrets are RFC-9001-public-value-derived,
+so the "raw secrets never requested" security property this rewrite protects was never about Initial
+in the first place — see §5.3's own paragraph, which already makes this argument in general terms;
+this correction just makes explicit that the argument covers *all* Initial use, not a subset of it).**
+`§10/OQ-4`'s "and nowhere else" should be read as "and nowhere else *among the concurrency-collision
+cases requiring a second, extra key set*" — not as "Initial-level protection has only these three
+call sites in the whole codebase." Fixed in §10 below.
+
+**Consequence for Step B, not just Step D — corrected split**: `ClientRolePacketParser.getAead`/
+`ServerRolePacketParser.getAead`'s primary branches and `SenderImpl.java:421` cannot be uniformly
+rewritten to "map `EncryptionLevel` to `KeySpace` and call the port" the way §3's call-site table
+currently implies for `QuicPacket`'s protect/unprotect callers in general. The correct branch,
+finalized: **`Handshake`/`App` → `QuicTlsPort.toKeySpace(level)` + the port calls (§3); `Initial`
+*and* `ZeroRTT` → keep calling `connectionSecrets.getPeerAead`/`getOwnAead(level)` and the legacy
+`Aead`-taking `QuicPacket.parsePacketNumberAndPayload`/`protectPacketNumberAndPayload` overload,
+unchanged for both levels.** (Not "Initial goes to the port, only ZeroRTT stays behind," which is
+what an implementer reading only §3/§4's earlier text plus this section's own first draft would have
+built.) This groups Initial with 0-RTT — both pre-/early-negotiation, public-ish secret material —
+against Handshake/App — both post-negotiation, the levels the WARN's raw-secrets concern is actually
+about — which is a more coherent split than the document's earlier framing implied, not an
+arbitrary one. See §8's Step B/D updates below for the corresponding staging changes.
 
 ### 6.2 `io.whitfin.siphash` — confirmed stays, exactly as the SOW says
 
@@ -608,47 +929,59 @@ Full inventory, from repo-wide greps of `ConnectionSecrets`, `KeyUpdateSupport`,
 `Aes128Gcm`, `Aes256Gcm`, `ChaCha20`:
 
 - `core/src/main/java/tech/kwik/core/crypto/`: `ConnectionSecrets.java` (**reduced, not deleted**, to
-  an Initial-only shape, per §5.3/§6.1's resolved recommendation), `CryptoStream.java` (**out of this
-  scope's remit**, §1.2), `KeyUpdateSupport.java` (deleted, §2.3), `Aead.java` (interface — most
-  methods deleted; the ratchet methods per §2.3 and the Handshake/App `aeadEncrypt`/`aeadDecrypt`
-  plumbing go, but the interface itself and its Initial-relevant methods remain, implemented by
-  `Aes128Gcm`), `BaseAeadImpl.java`, `Aes256Gcm.java`, `ChaCha20.java` (deleted — Handshake/App-level
-  cipher-suite machinery, no longer needed once those levels go through the port), `Aes128Gcm.java`
-  (**retained**, Initial-only — it's the concrete `Aead` `createKeys(Initial, ...)` and
-  `getInitialPeerSecretsForVersion` construct, and Initial is always
-  `TLS_AES_128_GCM_SHA256` per RFC 9001 §5.2), `MissingKeysException.java` (semantics preserved via
-  `QuicKeyUnavailableException`/`keysAvailable` for Handshake/App levels, retained as-is for the
-  Initial-only `ConnectionSecrets` — see §1.1).
+  an Initial-*and*-0-RTT shape — **corrected from "Initial-only" per §6.1.1/§6.1.2**),
+  `CryptoStream.java` (**out of this scope's remit**, §1.2), `KeyUpdateSupport.java` (deleted, §2.3),
+  `Aead.java` (interface — the ratchet methods per §2.3, **plus the non-default
+  `computeNextApplicationTrafficSecret()` per §6.1.1's addendum**, are deleted; the interface itself
+  and its Initial/0-RTT-relevant methods remain, implemented by `Aes128Gcm`/`Aes256Gcm`/`ChaCha20`),
+  `BaseAeadImpl.java`, `Aes256Gcm.java`, `ChaCha20.java` (**corrected from "deleted" — all three
+  retained per §6.1.1**: 0-RTT is cipher-suite-negotiated exactly like Handshake/App were, so the
+  cipher-suite-selection machinery these three provide still has a caller after Handshake/App go),
+  `Aes128Gcm.java` (retained — the concrete `Aead` for `createKeys(Initial, ...)`/
+  `getInitialPeerSecretsForVersion`, and still one of three cipher choices 0-RTT can select),
+  `MissingKeysException.java` (unchanged, no rework needed — confirmed in full in §6.1.2; continues
+  to serve the Initial/0-RTT levels that remain, exactly as it always has).
 - `core/src/main/java/tech/kwik/core/packet/`: `QuicPacket.java`, `ShortHeaderPacket.java` (rewrite,
-  §2.3/§3), `LongHeaderPacket.java` (calls the rewritten `QuicPacket` methods but needs no method-
-  body changes itself, confirmed by its two call sites both being into `QuicPacket`'s shared
-  helpers), `PacketParser.java`, `ClientRolePacketParser.java`, `ServerRolePacketParser.java`
-  (§1.4/§3), `RetryPacket.java` and `VersionNegotiationPacket.java` — **correction, added on
-  review: these two are NOT untouched.** Both files `import tech.kwik.core.crypto.Aead`
-  (`RetryPacket.java:23`, `VersionNegotiationPacket.java:23`) and both override the abstract
-  `QuicPacket` methods this rewrite changes the signature of — `parse(ByteBuffer, Aead, long, Logger,
-  int)` (`RetryPacket.java:130`, `VersionNegotiationPacket.java:73`) and `generatePacketBytes(Aead)`
-  (`RetryPacket.java:216`, `VersionNegotiationPacket.java:139`) — confirmed by grep that neither
-  method body ever dereferences the `aead` parameter (zero `aead.` call sites in either method): 
-  `RetryPacket` computes its own static-key AEAD integrity tag directly via `javax.crypto.Cipher`
-  (RFC 9001 §5.8's fixed public key, independent of TLS secrets, per §4's table), and
-  `VersionNegotiationPacket` has no encryption at all (it's a cleartext packet type). So when
-  `QuicPacket`'s abstract signatures change to take `QuicTlsPort`/`KeySpace` instead of `Aead`
-  (§3/§4), **both files need a mechanical, signature-only edit** — updating the parameter type on
-  these two overrides to keep the class compiling — even though neither file's actual logic changes
-  at all. Call this out explicitly in the implementation step (§8) so whoever does this doesn't
-  accidentally start "fixing" the real retry-integrity-tag or version-negotiation logic while
-  touching these files for what should be a one-line signature edit each.
+  §2.3/§3, **Handshake/App only — see §3's scope correction above**), `LongHeaderPacket.java` (calls
+  the rewritten `QuicPacket` methods but needs no method-body changes itself, confirmed by its two
+  call sites both being into `QuicPacket`'s shared helpers), `PacketParser.java`,
+  `ClientRolePacketParser.java`, `ServerRolePacketParser.java` (§1.4/§3, **now a branch, not a
+  uniform swap — §3's corrected "What ... change to" paragraph**), `InitialPacket.java` and
+  `ZeroRttPacket.java` — **new finding, not in earlier drafts: these two are explicitly unchanged,
+  not merely out of scope.** Per §6.1.1/§6.1.2/§3's correction, both keep using `QuicPacket`'s
+  existing `Aead`-taking `parse`/`generatePacketBytes` path forever (not just for the duration of
+  this rewrite) — `ZeroRttPacket.java` (read in full for §6.1.1) overrides none of the
+  protect/unprotect machinery itself, so as long as the `Aead`-taking abstract method signature on
+  `QuicPacket` survives (which it must, for this same reason), neither file needs a single line
+  touched by this rewrite. `RetryPacket.java` and `VersionNegotiationPacket.java` — **correction to
+  an earlier draft's correction: re-examined now that §3 has been narrowed to Handshake/App only,
+  the "mechanical signature-only edit" this section previously flagged for these two files is very
+  likely unnecessary — not just mechanical, but zero-diff.** Both files override the same
+  `Aead`-taking `parse(ByteBuffer, Aead, long, Logger, int)`/`generatePacketBytes(Aead)` abstract
+  methods that `InitialPacket`/`ZeroRttPacket` also keep using (confirmed above); if `QuicPacket`
+  keeps that signature exactly as-is for those four classes and adds separate, new, port-taking
+  method(s) used only by `HandshakePacket`/`ShortHeaderPacket` (the concrete class-hierarchy shape
+  for that split is a real Step B design choice, not fully pre-solved by this document — see §8's
+  Step B update), then `RetryPacket`/`VersionNegotiationPacket` genuinely need no edit at all, since
+  the method signature they override never changes. **Flag this explicitly for whoever executes
+  Step B: confirm this holds once the actual class-hierarchy shape is chosen, rather than assuming
+  either "mechanical edit" (this document's earlier claim) or "zero-diff" (this correction's
+  expectation) without checking against the real diff.**
 - `core/src/main/java/tech/kwik/core/impl/QuicConnectionImpl.java` (`:162`, `ConnectionSecrets`
   construction → port/engine construction, but the *triggering* calls — `computeInitialKeys`,
   `computeHandshakeSecrets`, etc. — live in `QuicClientConnectionImpl`/`ServerConnectionImpl` and
   are §3.3 driver-seam territory, not this document's scope; only the field type and constructor
   call at this one line are crypto-seam-adjacent).
 - `core/src/main/java/tech/kwik/core/server/impl/ServerConnectorImpl.java`,
-  `ServerConnectionCandidate.java` — §1.6/§5, need a scope decision before they can be re-pointed.
-- `core/src/main/java/tech/kwik/core/send/SenderImpl.java:421` — §1.6, the outbound `Aead`
-  selection call site.
-- `core/src/main/java/module-info.java` — `requires at.favre.lib.hkdf;` line, conditional on §5/§6.1.
+  `ServerConnectionCandidate.java` — **the scope decision is now made (§10/OQ-4, sign-off recorded
+  above): both are confirmed unchanged**, per §6.1.2's call-site confirmation.
+- `core/src/main/java/tech/kwik/core/send/SenderImpl.java:421` — §1.6, the outbound `Aead`/port
+  selection call site — **finalized as a branch, not a uniform re-point: `Handshake`/`App` select a
+  `KeySpace` and call the port; `Initial`/`ZeroRTT` keep calling
+  `connectionSecrets.getOwnAead(level)` and `packet.generatePacketBytes(aead)` exactly as today —
+  see §6.1.2.**
+- `core/src/main/java/module-info.java` — `requires at.favre.lib.hkdf;` line — **stays, unconditionally,
+  per §6.1.1's resolved recommendation (no longer conditional on §5, which is now resolved).**
 
 ### 7.2 Test code — this is the larger, less obvious blast radius
 
@@ -695,30 +1028,55 @@ Given the scale (§9) and the SOW's own preference for gated spikes over big-ban
 precedent), the crypto-seam rewrite specifically — as distinct from the driver seam (§3.3) — breaks
 into four independently-verifiable increments:
 
-**Step A — Key-space mapping + the §5 decision (prerequisite, ~1-2 days, reduced from ~2-3 now that
-the spike is done).** **Correction: the empirical spike this step originally scoped is
-CONFIRMED, not pending** — §5.1 records both the direct code proof (`QuicKeyManager.java:322-330`'s
-`old.discard(true)`) and the empirical result (real DirtyChai engine, two `deriveInitialKeys` calls,
-`AEADBadTagException` on the stale key), run for this document's review round. What Step A still
-needs to do, now narrower than originally scoped: (1) get an explicit board/Peter sign-off on §5.3/
-OQ-4's resolved recommendation (option (a), uniformly, for all three call sites — the analysis is
-done, per-site, in §5.2; this is a sign-off gate, not open investigation); (2) finalize the
-`EncryptionLevel`↔`KeySpace` mapping and the reduced `ConnectionSecrets` shape (Initial-only) once
-that sign-off lands. This step still produces no rewritten `QuicPacket` code — it's a
-decision-and-sign-off gate, not a verification spike anymore.
+**Step A — Key-space mapping + the §5 decision (prerequisite). CLOSED as of the sign-off recorded at
+the top of this document (2026-07-20).** **Correction: the empirical spike this step originally
+scoped is CONFIRMED, not pending** — §5.1 records both the direct code proof
+(`QuicKeyManager.java:322-330`'s `old.discard(true)`) and the empirical result (real DirtyChai
+engine, two `deriveInitialKeys` calls, `AEADBadTagException` on the stale key), run for this
+document's review round. Step A's two remaining items are both done: (1) **board/Peter sign-off on
+§5.3/OQ-4's resolved recommendation is recorded** (top of document, and §10/OQ-4 below) — option
+(a), approved as recommended, no changes; (2) **the `EncryptionLevel`↔`KeySpace` mapping (§4.1) and
+the reduced `ConnectionSecrets` shape (§6.1.1/§6.1.2) are both finalized to an implementation-ready
+spec** — including a correction discovered in the course of finalizing (2): the reduced shape is
+Initial-*and*-0-RTT, not Initial-only, and `Initial` (not just the three §5.2 edge cases) stays
+permanently off the port, alongside `ZeroRTT` (§6.1.1/§6.1.2/§3's scope correction). Step A produced
+no rewritten `QuicPacket` code, as scoped; Step B below is now unblocked with, per this
+finalization's own finding, less design ambiguity left in it than before (the `Initial`/`ZeroRTT`
+split from `Handshake`/`App` is now explicit) but a real open sub-question about `QuicPacket`'s exact
+class-hierarchy shape once split (flagged in Step B below, not resolved by this document since it's
+genuine Step B design work, not a Step A decision-and-sign-off item).
 
-**Step B — `QuicPacket`/`ShortHeaderPacket`/`LongHeaderPacket` call-site re-pointing (~4-6 days).**
-Rewrite the six call sites in §3 to talk to `QuicTlsPort` instead of `Aead`, including the
-structural `IntFunction<ByteBuffer>` header-generator change in `ShortHeaderPacket.generatePacketBytes`
-(§2.3). Delete the nonce-construction code (`encryptPayload`/`decryptPayload`'s IV-XOR logic) since
-the engine now owns nonce derivation. At this point `KeyUpdateSupport` and the ratchet call sites
-are **not yet deleted** — leave them as dead code behind the old `Aead` interface if that's the
-cheapest way to keep the build green mid-step, or delete them here if `ShortHeaderPacket`'s rewrite
-naturally removes their only call sites as a side effect (likely, per §2.3 — worth checking rather
-than assuming). Verify with a targeted round-trip test mirroring the week-1 spike (real two engines,
-one INITIAL packet each direction, tamper-byte negative path) extended to cover a `ShortHeaderPacket`/
-`ONE_RTT` round trip once Step C below has `setOneRttContext` wiring available from the driver-seam
-work.
+**Step B — `QuicPacket`/`ShortHeaderPacket`/`LongHeaderPacket` call-site re-pointing (~4-6 days;
+narrower in level-scope than originally drafted, per the correction below, but with a new
+class-hierarchy design question added — net effort likely similar, see §9).** **Correction, per
+§3/§6.1.1/§6.1.2's finalized scope: this step now applies to `HandshakePacket` and
+`ShortHeaderPacket` (App/1-RTT) only — not `InitialPacket` or `ZeroRttPacket`, which keep the
+existing `Aead`-taking path permanently (§6.1.1/§6.1.2).** Rewrite the Handshake/App call sites in
+§3 to talk to `QuicTlsPort` instead of `Aead`, including the structural `IntFunction<ByteBuffer>`
+header-generator change in `ShortHeaderPacket.generatePacketBytes` (§2.3). Delete the
+nonce-construction code (`encryptPayload`/`decryptPayload`'s IV-XOR logic) for those two packet
+types, since the engine now owns nonce derivation for them — `InitialPacket`/`ZeroRttPacket` keep
+using it, since they stay on the `Aead` path. **New open item for whoever executes this step (not
+resolved by this document, flagged so it isn't missed): decide `QuicPacket`'s exact class-hierarchy
+shape now that its two central methods are no longer uniform across all six concrete packet
+types** — e.g. keep the existing `Aead`-taking abstract `parse`/`generatePacketBytes` signature
+exactly as-is (used by `InitialPacket`, `ZeroRttPacket`, `RetryPacket`, `VersionNegotiationPacket`,
+all four requiring zero change per §7.1's corrected finding) and add new, separate port-taking
+method(s) that only `HandshakePacket`/`ShortHeaderPacket` implement/call, vs. some other structuring
+(e.g. a shared private helper both paths call into). This document deliberately does not pick one —
+it's real code-shape design work belonging to Step B's own implementer, not a Step A sign-off item —
+but flags it explicitly so Step B's implementer treats it as a decision to make, not an assumption to
+inherit from an already-uniform §3 table (§3's table itself has been corrected to say "Handshake/App
+only," but the class-hierarchy consequence of that split still needs a real design choice at Step B
+time). At this point `KeyUpdateSupport` and the ratchet call sites are **not yet deleted** — leave
+them as dead code behind the old `Aead` interface if that's the cheapest way to keep the build green
+mid-step, or delete them here if `ShortHeaderPacket`'s rewrite naturally removes their only call
+sites as a side effect (likely, per §2.3 — worth checking rather than assuming). Verify with a
+targeted round-trip test mirroring the week-1 spike (real two engines, one INITIAL packet each
+direction, tamper-byte negative path — note this INITIAL-level coverage now exercises the
+*unchanged*, `Aead`-based path per this step's narrowed scope, not the port) extended to cover a
+`ShortHeaderPacket`/`ONE_RTT` round trip once Step C below has `setOneRttContext` wiring available
+from the driver-seam work.
 
 **Correction — the §3.3 dependency here is more than "a minimal stub," sharpen accordingly.** The
 earlier draft's phrasing ("may need to borrow a minimal stub from §3.3") understates this. The stub
@@ -763,16 +1121,33 @@ the cipher suite classes, `at.favre.lib.hkdf`), which stays in Step D exactly as
 `ConnectionSecrets` diff should note that the `KeyUpdateSupport` wrapping is already gone by the time
 Step D starts, rather than re-deriving that fact.
 
-**Step D — `ConnectionSecrets`/dependency cleanup + full suite (~2-3 days, scope depends on Step
-A's decision).** Delete (or reduce, per §5) `ConnectionSecrets.java`, `BaseAeadImpl.java`,
-`Aes128Gcm.java`, `Aes256Gcm.java`, `ChaCha20.java`; remove `at.favre.lib.hkdf` from
-`build.gradle`/`module-info.java` if Step A's decision allows it; rewrite the 7-file test fixture
-migration (§7.2); re-point `SenderImpl.java:421` and the `ServerConnectorImpl`/
-`ServerConnectionCandidate` sites per Step A's chosen option; run the full `core` suite (baseline:
-990 tests, 989 pass / 1 pre-existing skip, per the RSA-fixture ADVICE doc's verification record) and
-confirm no new failures beyond ones explicitly expected from this rewrite. (By this point,
-`createKeys()`'s `App`-level `KeyUpdateSupport` wrapping has already been removed in Step C per the
-correction above — Step D's `ConnectionSecrets` diff is the rest of the file.)
+**Step D — `ConnectionSecrets`/dependency cleanup + full suite (~2-3 days; scope now finalized, not
+conditional on Step A — corrected below, net effect is smaller than the earlier "delete
+`ConnectionSecrets`" framing implied).** **Correction: this step no longer deletes
+`ConnectionSecrets.java`, `BaseAeadImpl.java`, `Aes256Gcm.java`, or `ChaCha20.java` — it *reduces*
+`ConnectionSecrets.java` to the Initial+0-RTT shape finalized in §6.1.2 (delete
+`computeHandshakeSecrets`, `computeApplicationSecrets`, the `selectedCipherSuite` field, and —
+recommended — `appendToFile`/`writeSecretsToFile`/`wiresharkSecretsFile`; keep everything else per
+§6.1.2's field/method table) and keeps `BaseAeadImpl.java`/`Aes256Gcm.java`/`ChaCha20.java`/
+`Aes128Gcm.java` all four, per §6.1.1's corrected file-survival table.** Delete `Aead.java`'s ratchet
+default methods plus the non-default `computeNextApplicationTrafficSecret()` (§6.1.1's addendum to
+§2.3's list) if not already fully removed in Step C. `at.favre.lib.hkdf` stays in
+`build.gradle`/`module-info.java` unconditionally (§6.1.1) — nothing to remove there. Rewrite the
+7-file test fixture migration (§7.2) — **unchanged in count and shape by this correction**, since
+the fixture need (a real or fake `Aead`/`Aes128Gcm`) is exactly the same whether `ConnectionSecrets`
+ends up Initial-only or Initial+0-RTT. **Re-pointing work at the call sites is smaller than earlier
+drafts estimated, confirmed concretely in §6.1.2**: `ServerConnectorImpl`/`ServerConnectionCandidate`
+need **zero changes** (confirmed unchanged, not merely "per Step A's chosen option" — that option is
+now fixed); `SenderImpl.java:421` and the two packet parsers' `getAead` methods need the
+`Handshake`/`App`-vs-`Initial`/`ZeroRTT` branch finalized in §6.1.2/§3, which Step B's own rewrite of
+those call sites already has to build (Step D just confirms it, doesn't add new branching logic on
+top). Run the full `core` suite (baseline: 990 tests, 989 pass / 1 pre-existing skip, per the
+RSA-fixture ADVICE doc's verification record) and confirm no new failures beyond ones explicitly
+expected from this rewrite, **including that `ZeroRttPacketTest.java` and the 0-RTT-exercising
+connection-level tests still pass unmodified** — a concrete regression signal if the Initial+0-RTT
+retention in `ConnectionSecrets` was implemented incorrectly. (By this point, `createKeys()`'s
+`App`-level `KeyUpdateSupport` wrapping has already been removed in Step C per the correction above
+— Step D's `ConnectionSecrets` diff is the rest of the file's Handshake/App-only material.)
 
 This ordering keeps `KeyUpdateSupport`'s deletion — the single highest-consequence item per the
 WARN — in its own small, reviewable step (C) rather than buried inside the larger AEAD re-pointing
@@ -790,54 +1165,73 @@ baseline **8-10 days**. This document's findings push that estimate up, concentr
 not previously accounted for:
 
 - **§5's Initial-key-multiplicity gap is new scope, not covered by any existing line in §7.2/§7.2a —
-  now resolved to the low-cost end of the original range.** §5.3/OQ-4 resolves to option (a),
-  narrow HKDF-only retention, for all three call sites — close to today's code, no `SSLContext`
-  plumbing into `ServerConnectorImpl`/`ServerConnectionCandidate` needed, and no new locking around
-  the shared-executor concurrency hazard found in §5.2.3 (since (a)'s per-call construction has no
-  shared mutable state to lock). **Updated cost: modest, not the "+3-5 days" upper bound this
-  document originally flagged for the throwaway/shared-engine options** — mostly the work of
-  reducing `ConnectionSecrets` to its Initial-only shape (§6.1/§7.1) and re-pointing the three call
-  sites to it, which is close to a no-op relative to today's code since they already use this exact
-  code path.
+  resolved to the low-cost end of the original range, and now finalized rather than merely
+  recommended.** §5.3/OQ-4 resolves to option (a), narrow HKDF-only retention — signed off (top of
+  document) — for all three §5.2 call sites *and*, per §6.1.2's correction, `Initial` generally
+  (not just those three) plus `ZeroRTT` (§6.1.1). Close to today's code, no `SSLContext` plumbing
+  into `ServerConnectorImpl`/`ServerConnectionCandidate` needed, no new locking around the
+  shared-executor concurrency hazard found in §5.2.3. **Updated cost: modest, confirmed (not just
+  estimated) now that §6.1.2's call-site check is done** — `ServerConnectorImpl`/
+  `ServerConnectionCandidate`/the three §5.2 sites need literally zero code changes (§6.1.2), and
+  Step D's `ConnectionSecrets` dependency-cleanup is *smaller* than earlier drafts estimated, not
+  larger: `Aes256Gcm.java`/`ChaCha20.java`/`BaseAeadImpl.java` are now known to survive (§6.1.1),
+  so Step D deletes less code than the original "delete `ConnectionSecrets`+4 cipher classes"
+  framing implied.
 - **The `ShortHeaderPacket.generatePacketBytes` structural rewrite (§2.3/§3) is more invasive than
-  "delegate to engine encrypt/decrypt/HP" suggests.** The header-generator-callback inversion is a
-  genuine control-flow change, not a substitution, and it is the one place where a subtle bug (e.g.
-  building the header template with a placeholder key-phase bit that doesn't get correctly
-  overwritten by the callback's actual argument) could silently produce wire-correct-looking but
-  wrong packets. Budget review time accordingly — this is exactly the kind of thing the Step B/Step
-  C split (§8) is meant to make reviewable in isolation.
+  "delegate to engine encrypt/decrypt/HP" suggests — still true, but now scoped to fewer packet
+  types.** The header-generator-callback inversion is a genuine control-flow change, not a
+  substitution, and it is the one place where a subtle bug (e.g. building the header template with a
+  placeholder key-phase bit that doesn't get correctly overwritten by the callback's actual
+  argument) could silently produce wire-correct-looking but wrong packets. Budget review time
+  accordingly — this is exactly the kind of thing the Step B/Step C split (§8) is meant to make
+  reviewable in isolation. **New, partially offsetting cost, found during this finalization pass**:
+  §3/§6.1.1/§6.1.2's correction that `Initial`/`ZeroRTT` stay off the port entirely means Step B's
+  `QuicPacket` rewrite now touches 2 of 6 concrete packet types (`HandshakePacket`,
+  `ShortHeaderPacket`) instead of an implied 4 (adding `InitialPacket`/`ZeroRttPacket` back in would
+  have been wrong, per §7.1's correction) — a real reduction in surface area — but it adds a new,
+  not-fully-resolved class-hierarchy design question (§8, Step B: how `QuicPacket` cleanly hosts both
+  the surviving `Aead`-taking path and the new port-taking path) that carries its own small
+  design/review cost. Net: roughly a wash against the earlier estimate, not a clear increase or
+  decrease — budget a small amount of extra design time up front in Step B specifically for that
+  class-hierarchy choice, which weighs cheaper against the reduced packet-type surface area than
+  it would have against the originally-implied broader one.
 - **The 7-file test-fixture migration (§7.2) is real, non-mechanical work**, not a mechanical
   find-replace — each of the 7 call sites needs a decision about whether it wants a real-engine
   fixture or a `FakeQuicTlsPort` stub, and the real-engine option requires the DirtyChai JDK toolchain
   to be available wherever these tests run (already true per §3.1's landed Gradle toolchain work,
-  but worth re-confirming it's still green before Step D starts).
+  but worth re-confirming it's still green before Step D starts). **Unchanged by this finalization
+  pass** — the fixture need is identical whether `ConnectionSecrets` ends up Initial-only or
+  Initial+0-RTT, since all 7 consumers just need a working `Aes128Gcm`/`Aead`, same as today.
 
-**Revised crypto-seam-specific estimate: ~12-16 days**, up from the SOW's implied ~8-10, driven
-by §5 (new scope the SOW didn't carry) and the fixture migration (known blast radius the SOW didn't
-enumerate). This is consistent with, and a refinement of, the SOW §7.2a's own framing that the
-6-8-week floor under-weights the crypto seam — it does not by itself change the overall 8-12-week
-program estimate, since some of this was likely already implicitly absorbed into the "+1-2 weeks"
-slack the honest estimate carries, but it should not be treated as free slack once this document's
-findings are accounted for explicitly.
+**Revised crypto-seam-specific estimate: ~12-16 days, unchanged from the prior revision.** The two
+corrections found while finalizing Step A's spec (0-RTT retention, `Initial`'s broader exclusion)
+roughly cancel out in net effort: Step D shrinks (less code deleted — `Aes256Gcm`/`ChaCha20`/
+`BaseAeadImpl` all survive, and the call-site re-pointing at the three §5.2 sites plus
+`ServerConnectorImpl`/`ServerConnectionCandidate` is now confirmed zero-touch, not just estimated
+close to zero), while Step B gains a small, contained class-hierarchy design decision. This is
+consistent with, and a refinement of, the SOW §7.2a's own framing that the 6-8-week floor
+under-weights the crypto seam — it does not by itself change the overall 8-12-week program estimate.
 
 **What could make it harder than even this revised estimate:**
 
-- **Superseded by §5.3/OQ-4's resolution**: the earlier draft flagged the risk of Step A's spike
-  confirming the worse outcome and OQ-4 landing on a throwaway/shared-engine option, requiring
-  `SSLContext` plumbing into `ServerConnectorImpl`/`ServerConnectionCandidate`. The spike is now
-  done (§5.1) and OQ-4 resolves to option (a) (§5.3), which needs none of that plumbing — this risk
-  no longer applies unless the board's sign-off on §5.3's recommendation overturns it.
+- **Superseded by §5.3/OQ-4's resolution and now by the board sign-off itself**: the earlier draft
+  flagged the risk of OQ-4 landing on a throwaway/shared-engine option, requiring `SSLContext`
+  plumbing into `ServerConnectorImpl`/`ServerConnectionCandidate`. The spike is done (§5.1), OQ-4
+  resolves to option (a) (§5.3), and — as of this revision — **the board has signed off on exactly
+  that recommendation with no changes** (top of document). This risk no longer applies at all.
 - The engine's autonomous 80%-confidentiality-limit key-update trigger (§2.2) interacting with
   kwik's own AEAD-limit tracking/connection-close-on-limit logic, if any exists elsewhere in the
   transport (not investigated as part of this document — flagged as a possible follow-up check
   during Step C, since two independent confidentiality-limit trackers, one now gone, is a milder
   version of the same "two authorities" shape the original WARN was about, just for a different
   invariant).
-- `ChaCha20`/cipher-suite-selection logic: this document did not verify whether the engine's cipher
-  suite negotiation is drivable/observable the same way kwik's `selectedCipherSuite` field
-  (`ConnectionSecrets.java:44`) is used elsewhere (e.g. for `NEW_SESSION_TICKET` or other
-  cipher-suite-conditional logic outside the AEAD path) — if any such use exists, it's an additional
-  small item Step D needs to account for.
+- **Resolved, no longer a risk**: this bullet previously flagged, as unverified, whether
+  `ConnectionSecrets`'s `selectedCipherSuite` field is read anywhere outside the AEAD path (e.g.
+  `NEW_SESSION_TICKET` logic). §6.1.2's full re-read of `ConnectionSecrets.java` for this
+  finalization pass settles it: the field has exactly one writer (`computeHandshakeSecrets`) and one
+  reader (`computeApplicationSecrets`), both deleted by this rewrite, and no other reference exists
+  anywhere in the file or (per grep) the tree. Nothing else depends on it; it is dead weight to
+  delete in Step D (§6.1.2), not an open risk.
 
 ---
 
@@ -893,8 +1287,13 @@ under §5.3/OQ-4's resolution**, since this call site keeps constructing a throw
 exactly as it does today (option (a)), never a port/engine instance, so there is no port
 client/server factory split to reconcile here. Left for traceability.
 
-**OQ-4 (HIGH — resolved to a concrete per-site recommendation below; still needs board/Peter
-sign-off, not a unilaterally final decision).** §5 laid out three options for the
+**OQ-4 (HIGH — RESOLVED, board/Peter sign-off recorded 2026-07-20, see top of document).** Approved
+as recommended below, with no changes, and implementation directed to proceed. §6.1.1/§6.1.2 finalize
+the two follow-on design items this sign-off unblocks (the `EncryptionLevel`↔`KeySpace` mapping and
+the reduced `ConnectionSecrets` shape) and record one correction to the resolution text below: it
+should be read as covering *all* `EncryptionLevel.Initial` use, not only the three call sites
+literally enumerated — see the "nowhere else" correction inline below and §6.1.2's fuller treatment.
+§5 laid out three options for the
 Initial-key-multiplicity gap without picking one. A follow-up review re-examined each of the three
 call sites individually against the question "does this site ever need two live Initial key sets at
 once, or is derive-then-discard always enough" — full evidence in §5.2 — and that evidence converges
@@ -968,16 +1367,28 @@ on a single answer applying to **all three sites, not a per-site split**:
   form reduced to Initial-level derivation only — the `computeInitialSecret`/`createKeys(Initial,
   ...)` path, `at.favre.lib.hkdf` and all, per §6.1) as a deliberate, narrow, permanently-documented
   exception to "everything else goes through the port," scoped strictly to
-  `EncryptionLevel.Initial`/`KeySpace.INITIAL`, used at exactly the three call sites in §5.2 and
-  nowhere else. **Confidence: high** on the evidence itself (every claim above is a direct code
-  citation, not inference); the recommendation is nonetheless presented for board/Peter sign-off,
-  not as unilaterally decided, because "make this the one permanent bypass of the port boundary" is
-  a policy call about the fork's own architecture, not a fact this document can settle by itself.
+  `EncryptionLevel.Initial`/`KeySpace.INITIAL`. **Correction, made while finalizing this
+  recommendation into an implementation-ready spec (§6.1.2): "used at exactly the three call sites
+  in §5.2 and nowhere else" undersold the scope and should be read as "used for every
+  `EncryptionLevel.Initial` need in the codebase, not just the three concurrency-collision cases §5.2
+  examined" — the primary connection's own everyday Initial-key bootstrap
+  (`QuicClientConnectionImpl.java:525`, `ServerConnectionImpl.java:181`) is a fourth, more
+  fundamental use that stays on this same path for the same reason (Initial secrets are
+  public-value-derived, so nothing about *which* call site derives them changes the security
+  argument), and routing it through the port instead while the three §5.2 sites keep a parallel
+  `ConnectionSecrets`-held Initial secret would recreate a two-authorities problem for Initial that
+  this recommendation is precisely trying to avoid. §6.1.1 similarly finalizes that `EncryptionLevel.ZeroRTT`
+  needs the same permanent-exception treatment, for a different reason (0-RTT re-pointing is a
+  separate SOW §3.5 work item, not yet done) — both corrections are additive to this recommendation,
+  not contradictions of it: the resolution's substance (option (a), for Initial, permanently) holds;
+  only its stated boundary needed sharpening.** **Confidence: high** on the evidence itself (every
+  claim above is a direct code citation, not inference). **Sign-off: APPROVED, 2026-07-20, as
+  recommended, with no changes** — see top of document.
   This also resolves §6.1's conditional framing of `at.favre.lib.hkdf`'s droppability
-  (**retained**, Initial-only, per the above — not dropped) and OQ-2's question about
+  (**retained**, scoped to Initial + 0-RTT per §6.1.1/§6.1.2 — not dropped) and OQ-2's question about
   `versionNegotiated(...)`'s one-shot `IllegalStateException` (**moot** — site 2 never calls that
   path on a shared/primary engine under this recommendation, since it never touches the port at all
-  for Initial-only work).
+  for this work).
 
 **OQ-5 (LOW-MEDIUM).** §7.1's WARN-adjacent risk this document surfaced (§9, "what could make it
 harder"): does kwik track its own AEAD confidentiality/integrity limits anywhere outside the
@@ -1050,3 +1461,64 @@ this document is making, so a future SOW revision can fold them in:
     rules out a shared engine for all three call sites, converging on option (a) — narrow HKDF-only
     retention — uniformly, contrary to this document's own earlier framing that treated the
     trade-off as genuinely close (§5.3, OQ-4).
+
+**Corrections added while finalizing Step A's implementation-ready spec (this revision, 2026-07-20;
+board/Peter sign-off on items 7-13 above and OQ-4 recorded at the top of this document):**
+
+14. **The reduced `ConnectionSecrets` shape cannot be "Initial-only," contrary to every earlier
+    section's phrasing (§4's table, §6.1, §7.1, §8's Step A/D, §10/OQ-4's resolution text) — it must
+    also retain `EncryptionLevel.ZeroRTT` (0-RTT) secret derivation, or this rewrite silently breaks
+    kwik's live, tested 0-RTT support** (`QuicClientConnectionImpl.java:585`,
+    `ServerConnectionImpl.java:282` call `computeEarlySecrets`; `ZeroRttPacket.java` funnels through
+    `QuicPacket`'s shared `Aead`-taking protect/unprotect methods with no override, exactly like
+    `InitialPacket`/`HandshakePacket`/`ShortHeaderPacket`; `ZeroRttPacketTest.java` is a real,
+    existing test). §3.5's "0-RTT re-pointing is out of scope" framing is still correct and
+    unchanged — but it was being conflated with "0-RTT's *existing* `ConnectionSecrets`-backed
+    machinery can be deleted," which does not follow and would have broken production behavior with
+    no replacement. This also means `Aes256Gcm.java`, `ChaCha20.java`, and `BaseAeadImpl.java` — all
+    three previously slated for deletion as "Handshake/App-only cipher-suite machinery" — **survive**,
+    since 0-RTT is cipher-suite-negotiated exactly like Handshake/App were, unlike Initial (§6.1.1).
+15. **`EncryptionLevel.Initial` is excluded from the port re-pointing for *all* its uses, not just the
+    three call sites §5.2 examined** — a correction to §10/OQ-4's resolution text ("used at exactly
+    the three call sites in §5.2 and nowhere else"), which omitted the primary connection's own
+    everyday, non-edge-case Initial-key bootstrap (`QuicClientConnectionImpl.java:525`,
+    `ServerConnectionImpl.java:181`) as a fourth use of the same permanently-retained path. The
+    substance of OQ-4's recommendation is unaffected (Initial stays off the port, permanently); only
+    its stated boundary was too narrow. This groups `Initial` with `ZeroRTT` (both pre-/early-secret,
+    "not fully negotiated yet" material) against `Handshake`/`App` (both post-negotiation, the
+    levels the WARN's raw-secrets concern is actually about) — a cleaner, more defensible split than
+    either earlier framing implied (§6.1.2, §3's scope correction, §10/OQ-4).
+16. **The `EncryptionLevel`↔`KeySpace` translation function should not live on `EncryptionLevel`
+    itself**, contrary to §4's original phrasing (by analogy with the existing `relatedPnSpace()`
+    instance method) — `EncryptionLevel` is in `tech.kwik.core.common`, exported unconditionally to
+    `tech.kwik.qlog`, which has no route to `jdk.internal.net.quic` (the DirtyChai `java.base`
+    qualified-export list names only `java.net.http` and `tech.kwik.core`, confirmed against
+    `core/build.gradle`'s own comment) — putting a `jdk.internal.net.quic`-typed public method on a
+    class exported into that module is a landmine, and contradicts `QuicTlsPort`'s own "single point
+    of contact" design goal. **Finalized placement: a static method on `QuicTlsPort` itself**
+    (`tech.kwik.core.tls`, not exported to `qlog`), matching this package's existing convention of
+    small static translation/predicate methods (`QuicTlsPortImpl.isQuicCompatible`,
+    `QuicTransportParametersExtension.isCodepoint`) rather than the source-enum-instance-method
+    convention, which doesn't fit here for the module-boundary reason above (§4.1).
+17. **Two small additional dead-code findings inside `ConnectionSecrets`, not previously called out**:
+    the `selectedCipherSuite` field (written only by the deleted `computeHandshakeSecrets`, read only
+    by the deleted `computeApplicationSecrets` — confirmed by a full re-read, no other reference
+    anywhere) and `appendToFile`/`writeSecretsToFile`/`wiresharkSecretsFile` (the Wireshark
+    secrets-file export, called only from the two deleted Handshake/App methods — neither
+    `computeInitialKeys` nor `computeEarlySecrets` ever used it) both become dead once Handshake/App
+    are deleted, and should be deleted alongside them in Step D rather than accidentally retained as
+    unreachable code (§6.1.2).
+18. **`Aead.java`'s `computeNextApplicationTrafficSecret()` was missing from §2.3's enumerated
+    ratchet-method deletion list** — it isn't a `default` method (every implementer must define it),
+    so §2.3's "ratchet-related default methods" framing didn't catch it, but it has exactly one
+    caller in the whole tree (`KeyUpdateSupport.computeKeyUpdate`), which Step C deletes — making
+    this method dead at the same point, on all three `Aead` implementers (§6.1.1's addendum to §2.3).
+19. **§7.1's "mechanical, signature-only edit" finding for `RetryPacket.java`/
+    `VersionNegotiationPacket.java` is likely too pessimistic, now that §3 has been narrowed to
+    Handshake/App only** — both files override the same `Aead`-taking abstract methods that
+    `InitialPacket`/`ZeroRttPacket` also keep using unchanged (item 14/15 above); if `QuicPacket`
+    preserves that signature as-is and adds new, separate port-taking method(s) only for
+    `HandshakePacket`/`ShortHeaderPacket` (a real Step B design choice, not resolved by this
+    document), `RetryPacket`/`VersionNegotiationPacket` need no edit at all, not even a mechanical
+    one. Flagged for Step B to confirm against whatever class-hierarchy shape it actually picks,
+    rather than assumed either way (§7.1, §8 Step B).
