@@ -86,10 +86,18 @@ import static tech.kwik.core.packet.HandshakeShortHeaderPacketRealEngineRoundTri
  *       test, to "a key-phase mismatch was reported and handled safely", without requiring an actual
  *       rollover to occur.</li>
  *   <li><b>Does not</b> prove that a genuine, real key-phase rollover (new keys actually installed
- *       and used by both engines) round-trips correctly. That would require either forcing the engine
- *       past its internal packet-count threshold (impractical here) or a JDK-internal test hook to
- *       force rollover (none is exposed to callers, by design -- see §2.2). This is a real, honestly-
- *       reported gap in what this test can exercise, not a claim being quietly avoided.</li>
+ *       and used by both engines) round-trips correctly. At the time this class was written that was
+ *       believed impractical (forcing the engine past its internal packet-count threshold means
+ *       ~6.7M packets at the default AES-GCM confidentiality limit, and no engine API lowers the
+ *       threshold) -- but it turned out the DirtyChai JDK's {@code jdk.quic.tls.keyLimits} security
+ *       property (read once, in {@code sun.security.ssl.QuicCipher}'s static initializer; lower-only
+ *       clamp) makes it entirely practical in a dedicated JVM. That gap is now closed by
+ *       {@link KeyLimitsRealRolloverRoundTripTest}, which drives a REAL engine-initiated rollover at
+ *       ~52 packets and verifies transparent post-rollover round trips both directions, old-key
+ *       retention for delayed pre-rollover packets, and post-rollover tamper rejection. It runs in
+ *       its own forked JVM (Gradle task {@code keyLimitsRolloverTest}, wired into {@code check})
+ *       because the lowered limit is JVM-global and would poison this class's own "no rollover
+ *       pressure at this volume" assumptions -- see that class's javadoc.</li>
  * </ul>
  */
 class KeyUpdateRatchetRemovalRealEngineRoundTripTest {

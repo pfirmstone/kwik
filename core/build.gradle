@@ -31,7 +31,35 @@ tasks.named('compileTestJava', JavaCompile).configure {
 }
 tasks.named('test', Test).configure {
     jvmArgs += ['--add-exports', 'java.base/jdk.internal.net.quic=ALL-UNNAMED']
+    // KeyLimitsRealRolloverRoundTripTest lowers the JVM-global (read-once, in a static initializer)
+    // jdk.quic.tls.keyLimits security property to force real engine-initiated key updates at ~52
+    // packets. In this shared suite JVM that would (a) silently not take effect if any other test
+    // initialized QUIC cipher classes first, and (b) if it DID take effect, inflict unexpected early
+    // key rollovers on every other real-engine test. So it is excluded here and runs only in the
+    // dedicated forked JVM of the keyLimitsRolloverTest task below.
+    exclude '**/KeyLimitsRealRolloverRoundTripTest*'
 }
+
+// Dedicated Test task (and therefore a dedicated forked JVM -- Gradle always runs Test tasks in a
+// separate test JVM, and this task's filter admits exactly one class) for the real key-update
+// rollover test. Wired into 'check' so a plain './gradlew build' still runs it. See the exclusion
+// comment on the 'test' task above and the test class's javadoc for the isolation rationale.
+def keyLimitsRolloverTest = tasks.register('keyLimitsRolloverTest', Test) {
+    description = 'Runs KeyLimitsRealRolloverRoundTripTest in its own JVM (jdk.quic.tls.keyLimits is JVM-global, read-once).'
+    group = 'verification'
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+    include '**/KeyLimitsRealRolloverRoundTripTest*'
+    jvmArgs += ['--add-exports', 'java.base/jdk.internal.net.quic=ALL-UNNAMED',
+                // for the test's guarded reflective read of the effective confidentiality limit
+                // (clear failure diagnostics); the test degrades gracefully without it
+                '--add-opens', 'java.base/sun.security.ssl=ALL-UNNAMED']
+    testLogging {
+        events "passed", "skipped", "failed"
+    }
+}
+tasks.named('check').configure { dependsOn keyLimitsRolloverTest }
 
 // FORMER KNOWN GAP, now closed: bumping only 'core' to language level 27 used to break Gradle's
 // variant-aware dependency resolution for the *other* subprojects that depend on it (qlog, interop,
