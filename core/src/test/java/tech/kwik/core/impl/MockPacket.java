@@ -27,6 +27,7 @@ import tech.kwik.core.frame.StreamFrame;
 import tech.kwik.core.log.Logger;
 import tech.kwik.core.packet.PacketMetaData;
 import tech.kwik.core.packet.QuicPacket;
+import tech.kwik.core.tls.QuicTlsPort;
 
 import java.nio.ByteBuffer;
 import java.util.List;
@@ -116,6 +117,27 @@ public class MockPacket extends QuicPacket {
 
     @Override
     public void parse(ByteBuffer data, Aead aead, long largestPacketNumber, Logger log, int sourceConnectionIdLength) throws DecryptionException {
+    }
+
+    /**
+     * MockPacket defaults to EncryptionLevel.App and is used generically in tests that drive packets
+     * through SenderImpl.send(...), which now dispatches App-level packets to the port-based overload
+     * (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§6.1.2) -- mirrors the trivial
+     * generatePacketBytes(Aead) above rather than throwing QuicPacket's default
+     * UnsupportedOperationException, since this is a test double for ANY encryption level, not one of
+     * the four that genuinely stay on the Aead-only path.
+     */
+    @Override
+    public byte[] generatePacketBytes(QuicTlsPort tlsPort) {
+        assert(packetNumber >= 0);
+        ByteBuffer buffer = ByteBuffer.allocate(Integer.max(12, packetSize));
+        buffer.putLong(packetNumber);
+        buffer.putInt(encryptionLevel.ordinal());
+        return buffer.array();
+    }
+
+    @Override
+    public void parse(ByteBuffer data, QuicTlsPort tlsPort, long largestPacketNumber, Logger log, int sourceConnectionIdLength) throws DecryptionException {
     }
 
     @Override

@@ -18,6 +18,7 @@
  */
 package tech.kwik.core.packet;
 
+import tech.kwik.core.crypto.Aead;
 import tech.kwik.core.impl.InvalidPacketException;
 import tech.kwik.core.impl.Version;
 import tech.kwik.core.log.Logger;
@@ -41,7 +42,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         RetryPacket retry = new RetryPacket(Version.getDefault());
-        retry.parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE);
+        retry.parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE);
 
         assertThat(retry.getRetryToken()).hasSize(0);
         assertThat(retry.validateIntegrityTag(new byte[] { 0x0e, 0x0e, 0x0e, 0x0e })).isFalse();
@@ -52,7 +53,7 @@ class RetryPacketTest {
         ByteBuffer data = ByteBuffer.wrap(new byte[] { (byte) 0xf0 });
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(data, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(data, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -61,7 +62,7 @@ class RetryPacketTest {
         ByteBuffer data = ByteBuffer.wrap(new byte[] { (byte) 0xf0, 0x00, 0x00, 0x00, 0x01 });
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(data, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(data, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -70,7 +71,7 @@ class RetryPacketTest {
         ByteBuffer data = ByteBuffer.wrap(new byte[] { (byte) 0xf0, 0x00, 0x00, 0x00, 0x0f, 0x04, 0x01, 0x02, 0x03, 0x04, 0x04, 0x01, 0x02, 0x03, 0x04 });
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(data, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(data, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -80,7 +81,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -90,7 +91,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -100,7 +101,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -111,7 +112,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -122,7 +123,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -132,7 +133,7 @@ class RetryPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(() ->
-                new RetryPacket(Version.getDefault()).parse(buffer, null, DONT_CARE, mock(Logger.class), DONT_CARE)
+                new RetryPacket(Version.getDefault()).parse(buffer, (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -142,10 +143,10 @@ class RetryPacketTest {
         byte[] dcid = new byte[] { 0, 1, 2, 3};
         byte[] odcid = new byte[] { 9, 9, 9, 9 };
         byte[] retryToken = new byte[32];
-        byte[] packetBytes = new RetryPacket(Version.getDefault(), scid, dcid, odcid, retryToken).generatePacketBytes(null);
+        byte[] packetBytes = new RetryPacket(Version.getDefault(), scid, dcid, odcid, retryToken).generatePacketBytes((Aead) null);
 
         RetryPacket deserializedPacket  = new RetryPacket(Version.getDefault());
-        deserializedPacket.parse(ByteBuffer.wrap(packetBytes), null, DONT_CARE, mock(Logger.class), DONT_CARE);
+        deserializedPacket.parse(ByteBuffer.wrap(packetBytes), (Aead) null, DONT_CARE, mock(Logger.class), DONT_CARE);
 
         assertThat(deserializedPacket.getSourceConnectionId()).isEqualTo(scid);
         assertThat(deserializedPacket.getDestinationConnectionId()).isEqualTo(dcid);

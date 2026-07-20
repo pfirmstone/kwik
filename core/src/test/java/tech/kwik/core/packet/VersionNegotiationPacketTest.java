@@ -18,6 +18,7 @@
  */
 package tech.kwik.core.packet;
 
+import tech.kwik.core.crypto.Aead;
 import tech.kwik.core.impl.InvalidPacketException;
 import tech.kwik.core.impl.Version;
 import tech.kwik.core.log.Logger;
@@ -48,7 +49,7 @@ class VersionNegotiationPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data.replace(" ", "")));
 
         VersionNegotiationPacket vn = new VersionNegotiationPacket();
-        vn.parse(buffer, null, 0, log, 0);
+        vn.parse(buffer, (Aead) null, 0, log, 0);
 
         assertThat(vn.getServerSupportedVersions()).hasSize(1);
     }
@@ -59,7 +60,7 @@ class VersionNegotiationPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(
-                () -> new VersionNegotiationPacket().parse(buffer, null, 0, log, 0)
+                () -> new VersionNegotiationPacket().parse(buffer, (Aead) null, 0, log, 0)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -69,7 +70,7 @@ class VersionNegotiationPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(
-                () -> new VersionNegotiationPacket().parse(buffer, null, 0, log, 0)
+                () -> new VersionNegotiationPacket().parse(buffer, (Aead) null, 0, log, 0)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -79,7 +80,7 @@ class VersionNegotiationPacketTest {
         ByteBuffer buffer = ByteBuffer.wrap(ByteUtils.hexToBytes(data));
 
         assertThatThrownBy(
-                () -> new VersionNegotiationPacket().parse(buffer, null, 0, log, 0)
+                () -> new VersionNegotiationPacket().parse(buffer, (Aead) null, 0, log, 0)
         ).isInstanceOf(InvalidPacketException.class);
     }
 
@@ -89,7 +90,7 @@ class VersionNegotiationPacketTest {
         VersionNegotiationPacket versionNegotiationPacket = new VersionNegotiationPacket(Version.getDefault(), new byte[]{ 0x01, 0x02, 0x03, 0x04 }, new byte[]{ 0x0a, 0x0b, 0x0c, 0x0d });
 
         // When
-        byte[] packetBytes = versionNegotiationPacket.generatePacketBytes(null);
+        byte[] packetBytes = versionNegotiationPacket.generatePacketBytes((Aead) null);
 
         // Then
         assertThat(packetBytes[0] & 0b11000000).isEqualTo(0b11000000);
@@ -99,11 +100,11 @@ class VersionNegotiationPacketTest {
     void createVersionNegotationPacket() throws Exception {
         // Given
         VersionNegotiationPacket versionNegotiationPacket = new VersionNegotiationPacket(Version.getDefault(), new byte[]{ 0x01, 0x02, 0x03, 0x04 }, new byte[]{ 0x0a, 0x0b, 0x0c, 0x0d });
-        byte[] packetBytes = versionNegotiationPacket.generatePacketBytes(null);
+        byte[] packetBytes = versionNegotiationPacket.generatePacketBytes((Aead) null);
         
         // When
         VersionNegotiationPacket vnPacket = new VersionNegotiationPacket();
-        vnPacket.parse(ByteBuffer.wrap(packetBytes), null, 0, log, 0);
+        vnPacket.parse(ByteBuffer.wrap(packetBytes), (Aead) null, 0, log, 0);
 
         // Then
         assertThat(vnPacket.getSourceConnectionId()).isEqualTo(new byte[]{ 0x01, 0x02, 0x03, 0x04 });

@@ -18,6 +18,7 @@
  */
 package tech.kwik.core.server.impl;
 
+import tech.kwik.core.crypto.Aead;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
@@ -181,7 +182,7 @@ class ServerConnectorImplTest {
         verify(serverSocket).send(argThat(returnedPacket -> {
             VersionNegotiationPacket vn = new VersionNegotiationPacket();
             try {
-                vn.parse(ByteBuffer.wrap(returnedPacket.getData()), null, 0, mock(Logger.class), 0);
+                vn.parse(ByteBuffer.wrap(returnedPacket.getData()), (Aead) null, 0, mock(Logger.class), 0);
                 return Arrays.equals(vn.getDestinationConnectionId(), new byte[] { 11, 12, 13, 14 })
                         &&
                         Arrays.equals(vn.getSourceConnectionId(), new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 });
@@ -421,7 +422,7 @@ class ServerConnectorImplTest {
     private boolean isVersionNegotiationPacket(byte[] data) {
         try {
             VersionNegotiationPacket vn = new VersionNegotiationPacket();
-            vn.parse(ByteBuffer.wrap(data), null, 0, mock(Logger.class), 0);
+            vn.parse(ByteBuffer.wrap(data), (Aead) null, 0, mock(Logger.class), 0);
             return true;
         } catch (Exception e) {
             return false;

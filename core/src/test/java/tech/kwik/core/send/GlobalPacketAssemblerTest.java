@@ -78,14 +78,14 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
     }
 
     @Test
-    void packetContainingInitialPacketMustBeGreaterThan1200Bytes() {
+    void packetContainingInitialPacketMustBeGreaterThan1200Bytes() throws Exception {
         sendRequestQueues[Initial.ordinal()].addRequest(new CryptoFrame(Version.getDefault(), new byte[36]), f -> {});
         sendRequestQueues[EncryptionLevel.Handshake.ordinal()].addRequest(new MaxDataFrame(105_000), f -> {});
 
         List<SendItem> packets = globalPacketAssembler.assemble(6000, MAX_PACKET_SIZE, new byte[0], new byte[0]).getItems();
 
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[p.getPacket().getEncryptionLevel().ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isGreaterThanOrEqualTo(1200);
         assertThat(datagramLength)
@@ -94,7 +94,7 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
     }
 
     @Test
-    void sizeOfPaddedInitialWithOnlySmallFrameShouldNotExceedMax() {
+    void sizeOfPaddedInitialWithOnlySmallFrameShouldNotExceedMax() throws Exception {
         // Given
         CryptoFrame smallFrame = new CryptoFrame(Version.getDefault(), new byte[36]);
         int minimalMaxSize = 1200;
@@ -105,13 +105,13 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[Initial.ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isEqualTo(1200);
     }
 
     @Test
-    void sizeOfPaddedInitialWithModeratelySizeFrameShouldNotExceedMax() {
+    void sizeOfPaddedInitialWithModeratelySizeFrameShouldNotExceedMax() throws Exception {
         // Given
         CryptoFrame smallFrame = new CryptoFrame(Version.getDefault(), new byte[187]);
         int minimalMaxSize = 1200;
@@ -122,13 +122,13 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[Initial.ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isEqualTo(1200);
     }
 
     @Test
-    void sizeOfCoalescedPaddedInitialWithOnlySmallFrameShouldNotExceedMax() {
+    void sizeOfCoalescedPaddedInitialWithOnlySmallFrameShouldNotExceedMax() throws Exception {
         // Given
         CryptoFrame smallFrame = new CryptoFrame(Version.getDefault(), new byte[36]);
         int minimalMaxSize = 1200;
@@ -140,13 +140,13 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[p.getPacket().getEncryptionLevel().ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isEqualTo(1200);
     }
 
     @Test
-    void sizeOfPaddedInitialWithOnlySmallFrameShouldNotBeLessThanRequiredMin() {
+    void sizeOfPaddedInitialWithOnlySmallFrameShouldNotBeLessThanRequiredMin() throws Exception {
         // Given
         QuicFrame smallestFrame = new PingFrame();
         int minimalMaxSize = 1200;
@@ -157,13 +157,13 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[Initial.ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isEqualTo(1200);
     }
 
     @Test
-    void edgeCaseWhereAssemblerFailsToGeneratePacketOfExactlyRequestedSize() {
+    void edgeCaseWhereAssemblerFailsToGeneratePacketOfExactlyRequestedSize() throws Exception {
         // Given
         globalPacketAssembler.enableAppLevel();
         int maximumSize = 88;
@@ -175,7 +175,7 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         int datagramLength = packets.stream()
-                .mapToInt(p -> p.getPacket().generatePacketBytes(levelKeys[p.getPacket().getEncryptionLevel().ordinal()]).length)
+                .mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length)
                 .sum();
         assertThat(datagramLength).isLessThanOrEqualTo(maximumSize);
         // Because it is a Handshake packet with a PathChallenge frame, it should be padded to the maximum size.
@@ -185,13 +185,13 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
     }
 
     @Test
-    void nonInitialPacketHasMiniumSize() {
+    void nonInitialPacketHasMiniumSize() throws Exception {
         globalPacketAssembler.enableAppLevel();
         sendRequestQueues[EncryptionLevel.App.ordinal()].addRequest(new CryptoFrame(Version.getDefault(), new byte[36]), f -> {});
 
         List<SendItem> packets = globalPacketAssembler.assemble(6000, MAX_PACKET_SIZE, new byte[0], new byte[0]).getItems();
 
-        int datagramLength = packets.stream().mapToInt(p -> p.getPacket().generatePacketBytes(aead).length).sum();
+        int datagramLength = packets.stream().mapToInt(p -> generatePacketBytesForTestUnchecked(p.getPacket()).length).sum();
         assertThat(datagramLength).isCloseTo(18 + 3 + 36, Percentage.withPercentage(5));
     }
 
@@ -233,7 +233,7 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
         int datagramLength = packets.stream()
                 .mapToInt(p -> {
                     QuicPacket packet = p.getPacket();
-                    byte[] generatedBytes = packet.generatePacketBytes(levelKeys[packet.getEncryptionLevel().ordinal()]);
+                    byte[] generatedBytes = generatePacketBytesForTestUnchecked(packet);
                     return generatedBytes.length;
                 })
                 .sum();
@@ -253,7 +253,7 @@ class GlobalPacketAssemblerTest extends AbstractSenderTest {
         int datagramLength = packets.stream()
                 .mapToInt(p -> {
                     QuicPacket packet = p.getPacket();
-                    byte[] generatedBytes = packet.generatePacketBytes(levelKeys[packet.getEncryptionLevel().ordinal()]);
+                    byte[] generatedBytes = generatePacketBytesForTestUnchecked(packet);
                     return generatedBytes.length;
                 })
                 .sum();

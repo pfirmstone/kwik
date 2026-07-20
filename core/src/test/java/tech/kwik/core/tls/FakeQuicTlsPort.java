@@ -48,6 +48,16 @@ import java.util.function.IntFunction;
  * {@code QuicTlsPortMockTestabilityTest}) can be unit-tested against this stub instead of a real
  * engine.
  *
+ * <p>Also reused, from {@code tech.kwik.core.packet}/{@code tech.kwik.core.send} tests, as the
+ * Handshake/App-level fixture for {@code HandshakePacket}/{@code ShortHeaderPacket}'s port-based
+ * {@code generatePacketBytes}/{@code parse} methods (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md
+ * §7.2/§8 Step B) -- for tests that only need structurally-correct, self-consistent round trips
+ * (byte layout, length accounting, key-phase bit plumbing), not real cryptographic correctness
+ * against external test vectors. {@link QuicTlsPortImplRealEngineTest} and the new real-engine
+ * Handshake/App round-trip coverage added for Step B are what verify actual crypto correctness
+ * against a real DirtyChai engine; this fake exists so the many structural/negative-path tests
+ * don't need one.
+ *
  * <p><b>Honest caveat (see the class javadoc on {@link QuicTlsPort}, and SOW §6.2):</b> because
  * {@code QuicTlsPort}'s own method signatures name real {@code jdk.internal.net.quic} types
  * directly (by design -- a thin pass-through, not a facade with a parallel type hierarchy), this
@@ -60,7 +70,7 @@ import java.util.function.IntFunction;
  * {@code SSLContext} QUIC-compatibility gating, no real engine instance, no actual handshake or
  * cryptography of any kind.
  */
-class FakeQuicTlsPort implements QuicTlsPort {
+public class FakeQuicTlsPort implements QuicTlsPort {
 
     // Test-controlled state -- set directly by test methods before exercising code under test.
     boolean useClientMode;
@@ -181,6 +191,16 @@ class FakeQuicTlsPort implements QuicTlsPort {
         keysAvailable.add(QuicTLSEngine.KeySpace.INITIAL);
     }
 
+    /**
+     * Test-only convenience so callers outside this package (e.g. {@code HandshakePacketTest},
+     * {@code ShortHeaderPacketTest}, {@code SenderImplTest} -- all reusing this fake per the class
+     * javadoc above) can seed {@link #keysAvailable} for Handshake/App-level {@code KeySpace}s
+     * without a real {@code deriveInitialKeys}/handshake-drive equivalent existing for those levels.
+     */
+    public void makeKeysAvailable(QuicTLSEngine.KeySpace keySpace) {
+        keysAvailable.add(keySpace);
+    }
+
     @Override
     public boolean keysAvailable(QuicTLSEngine.KeySpace keySpace) {
         return keysAvailable.contains(keySpace);
@@ -215,10 +235,20 @@ class FakeQuicTlsPort implements QuicTlsPort {
         if (!keysAvailable.contains(keySpace)) {
             throw new QuicKeyUnavailableException("fake: no keys", keySpace);
         }
-        // Trivial "encryption": just copy bytes through, no real AEAD. Good enough for testing
-        // driver logic that only checks call sequencing, not for testing crypto correctness --
-        // that is exactly what QuicTlsPortImplRealEngineTest is for.
+        // headerGenerator must still be invoked, even though this fake doesn't use its result as
+        // real AAD -- callers (ShortHeaderPacket in particular) rely on the invocation itself to
+        // resolve the key phase and finalize the header bytes they kept a reference to (ADVICE doc
+        // §2.3/§3's IntFunction inversion). A phase of 0 mirrors what a real engine would pass for a
+        // KeySpace where key phase isn't applicable (HANDSHAKE); tests that care about a specific
+        // phase value for ONE_RTT should not rely on this fake's arbitrary choice here.
+        headerGenerator.apply(0);
+        // Trivial "encryption": copy the plaintext through, then append a fixed-size, all-zero fake
+        // tag of getAuthTagSize() bytes -- not real authentication, but keeps output length accurate
+        // (payload + auth tag size) for tests that check estimateLength()-vs-actual-length
+        // accounting. No real AEAD; good enough for testing driver/structural logic, not crypto
+        // correctness -- that is exactly what QuicTlsPortImplRealEngineTest is for.
         output.put(packetPayload);
+        output.put(new byte[getAuthTagSize()]);
     }
 
     @Override
@@ -228,8 +258,16 @@ class FakeQuicTlsPort implements QuicTlsPort {
         if (!keysAvailable.contains(keySpace)) {
             throw new QuicKeyUnavailableException("fake: no keys", keySpace);
         }
+        // Inverse of encryptPacket above: strip the trailing fake tag, copy the rest through.
         packet.position(packet.position() + headerLength);
+        int plaintextLength = packet.remaining() - getAuthTagSize();
+        if (plaintextLength < 0) {
+            throw new IllegalArgumentException("fake: packet shorter than the fake auth tag size");
+        }
+        int savedLimit = packet.limit();
+        packet.limit(packet.position() + plaintextLength);
         output.put(packet);
+        packet.limit(savedLimit);
     }
 
     @Override

@@ -18,9 +18,12 @@
  */
 package tech.kwik.core.send;
 
+import jdk.internal.net.quic.QuicTLSEngine;
 import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.impl.TestUtils;
 import tech.kwik.core.crypto.Aead;
+import tech.kwik.core.packet.QuicPacket;
+import tech.kwik.core.tls.FakeQuicTlsPort;
 import org.junit.jupiter.api.BeforeEach;
 
 public class AbstractSenderTest {
@@ -29,12 +32,52 @@ public class AbstractSenderTest {
 
     protected Aead aead;
     protected Aead[] levelKeys = new Aead[4];
+    /**
+     * Handshake/App-level fixture (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§6.1.2):
+     * {@code aead}/{@code levelKeys} above still cover Initial/ZeroRTT, which stay on the legacy
+     * Aead path; Handshake and App packets now need a {@link tech.kwik.core.tls.QuicTlsPort} instead.
+     * See {@link #generatePacketBytesForTest(QuicPacket)}.
+     */
+    protected FakeQuicTlsPort tlsPort;
 
     @BeforeEach
     void initKeys() throws Exception {
         aead = TestUtils.createKeys();
         for (int i = 0; i < EncryptionLevel.values().length; i++) {
             levelKeys[i] = TestUtils.createKeys();
+        }
+        tlsPort = new FakeQuicTlsPort();
+        tlsPort.makeKeysAvailable(QuicTLSEngine.KeySpace.HANDSHAKE);
+        tlsPort.makeKeysAvailable(QuicTLSEngine.KeySpace.ONE_RTT);
+    }
+
+    /**
+     * Dispatches to the Aead-taking or port-taking {@code generatePacketBytes} overload depending on
+     * the packet's encryption level (ADVICE doc §3/§6.1.2): Handshake/App use {@link #tlsPort} above;
+     * Initial/ZeroRTT keep using the per-level {@link #levelKeys} Aead fixture. Centralizes the branch
+     * so call sites that used to call {@code generatePacketBytes(aead)}/{@code generatePacketBytes(levelKeys[...])}
+     * uniformly across all packet types (before Handshake/App moved to the port) don't each need to
+     * know which path a given packet's level is on.
+     */
+    protected byte[] generatePacketBytesForTest(QuicPacket packet) throws Exception {
+        EncryptionLevel level = packet.getEncryptionLevel();
+        if (level == EncryptionLevel.Handshake || level == EncryptionLevel.App) {
+            return packet.generatePacketBytes(tlsPort);
+        }
+        return packet.generatePacketBytes(levelKeys[level.ordinal()]);
+    }
+
+    /**
+     * Same as {@link #generatePacketBytesForTest(QuicPacket)}, wrapping the checked exceptions in an
+     * unchecked one -- for call sites inside a lambda passed to {@code Stream.mapToInt(...)} etc.,
+     * where a checked exception can't be thrown directly.
+     */
+    protected byte[] generatePacketBytesForTestUnchecked(QuicPacket packet) {
+        try {
+            return generatePacketBytesForTest(packet);
+        }
+        catch (Exception e) {
+            throw new RuntimeException(e);
         }
     }
 }

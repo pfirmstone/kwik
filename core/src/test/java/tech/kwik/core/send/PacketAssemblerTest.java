@@ -26,7 +26,6 @@ import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.common.PnSpace;
 import tech.kwik.core.frame.*;
 import tech.kwik.core.impl.MockPacket;
-import tech.kwik.core.impl.TestUtils;
 import tech.kwik.core.impl.Version;
 import tech.kwik.core.impl.VersionHolder;
 import tech.kwik.core.packet.HandshakePacket;
@@ -77,7 +76,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
 
     //region basic test cases
     @Test
-    void sendSingleShortPacket() {
+    void sendSingleShortPacket() throws Exception {
         // Given
         byte[] destCid = new byte[] { 0x0c, 0x0a, 0x0f, 0x0e };
 
@@ -89,7 +88,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
         assertThat(packet).isInstanceOf(ShortHeaderPacket.class);
         assertThat(packet.getDestinationConnectionId()).isEqualTo(destCid);
         assertThat(packet.getFrames()).containsExactly(new StreamFrame(0, new byte[7], true));
-        assertThat(packet.generatePacketBytes(aead).length).isLessThan(MAX_PACKET_SIZE);
+        assertThat(generatePacketBytesForTest(packet).length).isLessThan(MAX_PACKET_SIZE);
     }
 
     @Test
@@ -112,7 +111,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
     }
 
     @Test
-    void sendAckAndStreamData() {
+    void sendAckAndStreamData() throws Exception {
         // Given
         oneRttAckGenerator.packetReceived(new MockPacket(0, 20, EncryptionLevel.App));
         oneRttAckGenerator.packetReceived(new MockPacket(3, 20, EncryptionLevel.App));
@@ -135,11 +134,11 @@ class PacketAssemblerTest extends AbstractSenderTest {
             assertThat(frame).isInstanceOf(AckFrame.class);
             assertThat(((AckFrame) frame).getLargestAcknowledged()).isEqualTo(10);
         });
-        assertThat(packet.generatePacketBytes(aead).length).isCloseTo(MAX_PACKET_SIZE, Percentage.withPercentage(0.25));
+        assertThat(generatePacketBytesForTest(packet).length).isCloseTo(MAX_PACKET_SIZE, Percentage.withPercentage(0.25));
     }
 
     @Test
-    void sendMultipleFrames() {
+    void sendMultipleFrames() throws Exception {
         // When
         sendRequestQueue.addRequest(new MaxStreamDataFrame(0, 0x01000000000000l), null);   // 10 bytes
         sendRequestQueue.addRequest(new MaxDataFrame(0x05000000000000l), null);              //  9 bytes
@@ -154,11 +153,11 @@ class PacketAssemblerTest extends AbstractSenderTest {
             // Stream Frame overhead: 5 bytes, so Stream Frame can contain 1187 ~ 1190 bytes
             assertThat(((StreamFrame) frame).getStreamData().length).isBetween(1187, 1192);
         });
-        assertThat(packet.generatePacketBytes(aead).length).isCloseTo(MAX_PACKET_SIZE, Percentage.withPercentage(0.25));
+        assertThat(generatePacketBytesForTest(packet).length).isCloseTo(MAX_PACKET_SIZE, Percentage.withPercentage(0.25));
     }
 
     @Test
-    void whenFirstFrameDoesNotFitFindOneThatDoes() {
+    void whenFirstFrameDoesNotFitFindOneThatDoes() throws Exception {
         // Given
         int remainingCwndSize = 25;  // Which leaves room for approx 7 bytes payload.
 
@@ -174,11 +173,11 @@ class PacketAssemblerTest extends AbstractSenderTest {
         assertThat(packet.getFrames())
                 .hasAtLeastOneElementOfType(DataBlockedFrame.class)
                 .hasAtLeastOneElementOfType(StreamFrame.class);
-        assertThat(packet.generatePacketBytes(aead).length).isLessThanOrEqualTo(remainingCwndSize);
+        assertThat(generatePacketBytesForTest(packet).length).isLessThanOrEqualTo(remainingCwndSize);
     }
 
     @Test
-    void sendHandshakePacketWithMaxLengthCrypto() {
+    void sendHandshakePacketWithMaxLengthCrypto() throws Exception {
         // Given
         byte[] srcCid = new byte[] { (byte) 0xba, (byte) 0xbe };
         byte[] destCid = new byte[] { 0x0c, 0x0a, 0x0f, 0x0e };
@@ -188,7 +187,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         QuicPacket packet = handshakePacketAssembler.assemble(12000, MAX_PACKET_SIZE, srcCid, destCid).get().getPacket();
-        int generatedPacketLength = packet.generatePacketBytes(aead).length;
+        int generatedPacketLength = generatePacketBytesForTest(packet).length;
 
         assertThat(packet).isInstanceOf(HandshakePacket.class);
         assertThat(((HandshakePacket) packet).getSourceConnectionId()).isEqualTo(srcCid);
@@ -204,7 +203,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
 
     //region initial packet
     @Test
-    void sendInitialPacketWithToken() {
+    void sendInitialPacketWithToken() throws Exception {
         // Given
         byte[] srcCid = new byte[] { (byte) 0xba, (byte) 0xbe };
         byte[] destCid = new byte[] { 0x0c, 0x0a, 0x0f, 0x0e };
@@ -222,12 +221,12 @@ class PacketAssemblerTest extends AbstractSenderTest {
                 .hasSize(1)
                 .hasOnlyElementsOfTypes(CryptoFrame.class);
         assertThat(((InitialPacket) packet).getToken()).hasSize(16);
-        assertThat(packet.generatePacketBytes(aead).length)
+        assertThat(generatePacketBytesForTest(packet).length)
                 .isLessThanOrEqualTo(MAX_PACKET_SIZE);
     }
 
     @Test
-    void sendInitialPacketWithoutToken() {
+    void sendInitialPacketWithoutToken() throws Exception {
         // Given
         byte[] srcCid = new byte[] { (byte) 0xba, (byte) 0xbe };
         byte[] destCid = new byte[] { 0x0c, 0x0a, 0x0f, 0x0e };
@@ -243,12 +242,12 @@ class PacketAssemblerTest extends AbstractSenderTest {
         assertThat(packet.getFrames())
                 .hasSize(1)
                 .hasOnlyElementsOfTypes(CryptoFrame.class);
-        assertThat(packet.generatePacketBytes(aead).length)
+        assertThat(generatePacketBytesForTest(packet).length)
                 .isLessThanOrEqualTo(MAX_PACKET_SIZE);
     }
 
     @Test
-    void anyInitialPacketShouldHaveToken() {
+    void anyInitialPacketShouldHaveToken() throws Exception {
         // Given
         initialPacketAssembler.setInitialToken(new byte[] { 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07 });
         initialAckGenerator.packetReceived(new MockPacket(0, 20, EncryptionLevel.Initial));
@@ -261,7 +260,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
         assertThat(packet.getFrames())
                 .hasOnlyElementsOfTypes(AckFrame.class, Padding.class);
         assertThat(packet.getToken()).hasSize(8);
-        assertThat(packet.generatePacketBytes(aead).length)
+        assertThat(generatePacketBytesForTest(packet).length)
                 .isLessThanOrEqualTo(MAX_PACKET_SIZE);
     }
     //endregion
@@ -655,7 +654,7 @@ class PacketAssemblerTest extends AbstractSenderTest {
 
         // Then
         QuicPacket packet = item.get().getPacket();
-        assertThat(packet.generatePacketBytes(TestUtils.createKeys()).length).isLessThanOrEqualTo(maxSize);
+        assertThat(generatePacketBytesForTest(packet).length).isLessThanOrEqualTo(maxSize);
     }
 
     @Test

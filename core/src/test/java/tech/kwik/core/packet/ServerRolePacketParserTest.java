@@ -44,8 +44,8 @@ class ServerRolePacketParserTest {
         Logger logger = mock(Logger.class);
         VersionHolder version = new VersionHolder(Version.QUIC_version_1);
         ConnectionSecrets connectionSecrets = new ConnectionSecrets(version, Role.Server, null, logger);
-        parser = new ServerRolePacketParser(connectionSecrets, version, 0, false, null, null, logger);
-        retryRequiredParser = new ServerRolePacketParser(connectionSecrets, version, 0, true, null, null, logger);
+        parser = new ServerRolePacketParser(connectionSecrets, null, version, 0, false, null, null, logger);
+        retryRequiredParser = new ServerRolePacketParser(connectionSecrets, null, version, 0, true, null, null, logger);
     }
 
     @Test

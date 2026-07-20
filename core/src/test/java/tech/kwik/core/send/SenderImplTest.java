@@ -72,10 +72,15 @@ class SenderImplTest extends AbstractSenderTest {
 
         connectionSecrets = mock(ConnectionSecrets.class);
         Aead aead = TestUtils.createKeys();
+        // Only Initial/ZeroRTT still go through ConnectionSecrets.getOwnAead (§3/§6.1.2) -- kept
+        // stubbed generically since some tests below exercise EncryptionLevel.Initial sends.
         when(connectionSecrets.getOwnAead(any(EncryptionLevel.class))).thenReturn(aead);
 
         sender = new SenderImpl(clock, new VersionHolder(Version.getDefault()), 1200, socket, peerAddress, connection, "", 100, new NullLogger());
         FieldSetter.setField(sender, sender.getClass().getDeclaredField("connectionSecrets"), connectionSecrets);
+        // Handshake/App sends move to the port instead (§3/§6.1.2) -- SenderImpl.send() branches on
+        // EncryptionLevel and never consults connectionSecrets for those two levels anymore.
+        FieldSetter.setField(sender, sender.getClass().getDeclaredField("tlsPort"), tlsPort);
     }
 
     @Test

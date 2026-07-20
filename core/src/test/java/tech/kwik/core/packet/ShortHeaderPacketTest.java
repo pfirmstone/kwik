@@ -18,24 +18,39 @@
  */
 package tech.kwik.core.packet;
 
-import tech.kwik.core.impl.TestUtils;
+import jdk.internal.net.quic.QuicTLSEngine;
+import org.junit.jupiter.api.BeforeEach;
 import tech.kwik.core.impl.Version;
-import tech.kwik.core.crypto.Aead;
 import tech.kwik.core.frame.PingFrame;
 import tech.kwik.core.frame.StreamFrame;
+import tech.kwik.core.tls.FakeQuicTlsPort;
 import org.junit.jupiter.api.Test;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+/**
+ * ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§8 Step B: ShortHeaderPacket moved from the
+ * Aead-taking protect/unprotect path to the QuicTlsPort-taking one (App/ONE_RTT). Uses
+ * {@link FakeQuicTlsPort} -- these tests only need structurally-correct, self-consistent byte-length
+ * accounting, not cryptographic correctness against an external reference; that is covered separately
+ * (see QuicTlsPortImplRealEngineTest and the new Step B real-engine round-trip coverage).
+ */
 class ShortHeaderPacketTest {
+
+    private FakeQuicTlsPort port;
+
+    @BeforeEach
+    void initFakePort() {
+        port = new FakeQuicTlsPort();
+        port.makeKeysAvailable(QuicTLSEngine.KeySpace.ONE_RTT);
+    }
 
     @Test
     void packetWithMinimalFrameShouldBePaddedToGetEnoughBytesForEncrypting() throws Exception {
         ShortHeaderPacket shortHeaderPacket = new ShortHeaderPacket(Version.getDefault(), new byte[]{ 0x0e, 0x0e, 0x0e, 0x0e }, new PingFrame());
         shortHeaderPacket.setPacketNumber(1);
 
-        Aead aead = TestUtils.createKeys();
-        shortHeaderPacket.generatePacketBytes(aead);
+        shortHeaderPacket.generatePacketBytes(port);
 
         // If it gets here, it is already sure the encryption succeeded.
         assertThat(shortHeaderPacket.getFrames()).hasAtLeastOneElementOfType(PingFrame.class);
@@ -48,7 +63,7 @@ class ShortHeaderPacketTest {
         shortHeaderPacket.setPacketNumber(54321);
 
         int estimatedLength = shortHeaderPacket.estimateLength(0);
-        int actualLength = shortHeaderPacket.generatePacketBytes(TestUtils.createKeys()).length;
+        int actualLength = shortHeaderPacket.generatePacketBytes(port).length;
 
         // Then
         assertThat(actualLength).isLessThanOrEqualTo(estimatedLength);  // By contract!
@@ -63,7 +78,7 @@ class ShortHeaderPacketTest {
         int estimatedLength = shortHeaderPacket.estimateLength(0);
 
         shortHeaderPacket.setPacketNumber(0);
-        int minLength = shortHeaderPacket.generatePacketBytes(TestUtils.createKeys()).length;
+        int minLength = shortHeaderPacket.generatePacketBytes(port).length;
 
         // Then
         assertThat(minLength).isLessThanOrEqualTo(estimatedLength);       // By contract!
@@ -79,7 +94,7 @@ class ShortHeaderPacketTest {
 
         // When
         int estimatedLength = shortHeaderPacket.estimateLength(0);
-        int actualLength = shortHeaderPacket.generatePacketBytes(TestUtils.createKeys()).length;
+        int actualLength = shortHeaderPacket.generatePacketBytes(port).length;
 
         // Then
         assertThat(actualLength).isLessThanOrEqualTo(estimatedLength);  // By contract!

@@ -18,6 +18,7 @@
  */
 package tech.kwik.core.server.impl;
 
+import tech.kwik.core.crypto.Aead;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -449,14 +450,14 @@ class ServerConnectionImplTest {
         ArgumentCaptor<RetryPacket> argumentCaptor1 = ArgumentCaptor.forClass(RetryPacket.class);
 
         verify(connection.getSender()).send(argumentCaptor1.capture());
-        byte[] retryPacket1 = argumentCaptor1.getValue().generatePacketBytes(null);
+        byte[] retryPacket1 = argumentCaptor1.getValue().generatePacketBytes((Aead) null);
         clearInvocations(connection.getSender());
 
         // When
         connection.getPacketProcessorChain().processPacket(secondInitialPacket, metaDataForNow());
         ArgumentCaptor<RetryPacket> argumentCaptor2 = ArgumentCaptor.forClass(RetryPacket.class);
         verify(connection.getSender()).send(argumentCaptor2.capture());
-        byte[] retryPacket2 = argumentCaptor1.getValue().generatePacketBytes(null);
+        byte[] retryPacket2 = argumentCaptor1.getValue().generatePacketBytes((Aead) null);
 
         // Then
         assertThat(retryPacket1).isEqualTo(retryPacket2);

@@ -43,7 +43,7 @@ class ClientRolePacketParserTest {
         Logger logger = mock(Logger.class);
         VersionHolder version = new VersionHolder(Version.QUIC_version_1);
         ConnectionSecrets connectionSecrets = new ConnectionSecrets(version, Role.Server, null, logger);
-        parser = new ClientRolePacketParser(connectionSecrets, version, 0, new byte[8], null, null, logger);
+        parser = new ClientRolePacketParser(connectionSecrets, null, version, 0, new byte[8], null, null, logger);
     }
 
     @Test
