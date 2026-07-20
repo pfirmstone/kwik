@@ -30,6 +30,7 @@ import tech.kwik.core.impl.Role;
 import tech.kwik.core.impl.TransportError;
 import tech.kwik.core.impl.VersionHolder;
 import tech.kwik.core.log.Logger;
+import tech.kwik.core.tls.QuicTlsPort;
 
 import java.nio.ByteBuffer;
 import java.util.function.Supplier;
@@ -45,13 +46,20 @@ public class ServerRolePacketParser extends PacketParser {
     private final boolean retryRequired;
     private final Supplier<QuicConnectionImpl.VersionNegotiationStatus> versionNegotiationStatusSupplier;
 
-    public ServerRolePacketParser(ConnectionSecrets secrets, VersionHolder quicVersion, int cidLength, boolean retryRequired,
+    public ServerRolePacketParser(ConnectionSecrets secrets, QuicTlsPort tlsPort, VersionHolder quicVersion, int cidLength, boolean retryRequired,
                                   PacketFilter processor, Supplier<QuicConnectionImpl.VersionNegotiationStatus> versionNegotiationStatusSupplier, Logger logger) {
-        super(secrets, quicVersion, cidLength, processor, Role.Server, logger);
+        super(secrets, tlsPort, quicVersion, cidLength, processor, Role.Server, logger);
         this.retryRequired = retryRequired;
         this.versionNegotiationStatusSupplier = versionNegotiationStatusSupplier;
     }
 
+    /**
+     * Get the AEAD to decrypt the given packet -- Initial/ZeroRTT only; Handshake/App are re-pointed
+     * to {@code QuicTlsPort} and never reach this method (see {@code PacketParser.parsePacket}'s
+     * branch, ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§6.1.2). The Handshake/App
+     * wrong-version-drop branch this method used to have is hoisted into {@code parsePacket} instead,
+     * since it no longer has an Aead lookup to piggyback on.
+     */
     @Override
     protected Aead getAead(QuicPacket packet, ByteBuffer data) throws MissingKeysException, InvalidPacketException, TransportError {
         Aead aead;
@@ -77,13 +85,6 @@ public class ServerRolePacketParser extends PacketParser {
 
         if (packet.getVersion().equals(quicVersion.getVersion())) {
             aead = connectionSecrets.getPeerAead(packet.getEncryptionLevel());
-        }
-        else if (packet.getEncryptionLevel() == App || packet.getEncryptionLevel() == Handshake) {
-            // https://www.rfc-editor.org/rfc/rfc9369.html#name-compatible-negotiation-requ
-            // "Both endpoints MUST send Handshake or 1-RTT packets using the negotiated version. An endpoint MUST
-            //  drop packets using any other version."
-            log.warn("Dropping packet not using negotiated version");
-            throw new InvalidPacketException("invalid version");
         }
         else if (packet.getEncryptionLevel() == ZeroRTT) {
             // https://www.rfc-editor.org/rfc/rfc9369.html#name-compatible-negotiation-requ

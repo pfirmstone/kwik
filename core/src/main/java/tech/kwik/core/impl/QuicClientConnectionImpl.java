@@ -377,7 +377,7 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         generateInitialKeys();
 
         receiver.start();
-        sender.start(connectionSecrets);
+        sender.start(connectionSecrets, tlsPort);
         startReceiverLoop();
 
         startHandshake(applicationProtocol, !earlyData.isEmpty());
@@ -481,7 +481,7 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
     private void receiveAndProcessPackets() {
         Thread currentThread = Thread.currentThread();
         int receivedPacketCounter = 0;
-        parser = new ClientRolePacketParser(connectionSecrets, quicVersion, connectionIdManager.getConnectionIdLength(),
+        parser = new ClientRolePacketParser(connectionSecrets, tlsPort, quicVersion, connectionIdManager.getConnectionIdLength(),
                 connectionIdManager.getOriginalDestinationConnectionId(),
                 createProcessorChain(), this::handleUnprotectPacketFailure, log);
         DatagramFilter datagramProcessingChain = new DatagramPostProcessingFilter(this::datagramProcessed,

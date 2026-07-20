@@ -28,6 +28,7 @@ import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.concurrent.DaemonThreadFactory;
 import tech.kwik.core.crypto.ConnectionSecrets;
 import tech.kwik.core.crypto.CryptoStream;
+import tech.kwik.core.tls.QuicTlsPort;
 import tech.kwik.core.frame.*;
 import tech.kwik.core.log.Logger;
 import tech.kwik.core.packet.BasePacketFilter;
@@ -121,6 +122,17 @@ public abstract class QuicConnectionImpl implements QuicConnection, PacketProces
     protected VersionNegotiationStatus versionNegotiationStatus = VersionNegotiationStatus.NotStarted;
 
     protected final ConnectionSecrets connectionSecrets;
+    /**
+     * Port used for Handshake/App-level packet protection (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md
+     * §3/§6.1.2). Deliberately null for now: constructing a real per-connection {@code QuicTlsPort}
+     * (an SSLContext-backed engine, driven through an actual TLS 1.3 handshake) is the handshake-driver
+     * seam (SOW §3.3), a separate, not-yet-built work item -- see the doc's §8 Step B entry. Until that
+     * lands, a real connection reaching a Handshake/App-level send or receive will fail loudly
+     * (NullPointerException / QuicKeyUnavailableException, depending on the path) rather than silently
+     * produce wrong output; this is the expected, flagged state of an in-progress staged rewrite, not a
+     * hidden regression on this branch.
+     */
+    protected volatile QuicTlsPort tlsPort;
     protected volatile HandshakeState handshakeState = HandshakeState.Initial;
     protected final Object handshakeStateLock = new Object();
     protected List<HandshakeStateListener> handshakeStateListeners = new CopyOnWriteArrayList<>();

@@ -179,7 +179,7 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
             token = null;
         }
         connectionSecrets.computeInitialKeys(originalDcid);
-        sender.start(connectionSecrets);
+        sender.start(connectionSecrets, tlsPort);
 
         streamManager = new StreamManager(this, Role.Server, log, configuration, callbackThread);
 
@@ -198,7 +198,7 @@ public class ServerConnectionImpl extends QuicConnectionImpl implements ServerCo
     }
 
     PacketParser createParser() {
-        return new ServerRolePacketParser(connectionSecrets, quicVersion, getSourceConnectionIdLength(), retryRequired,
+        return new ServerRolePacketParser(connectionSecrets, tlsPort, quicVersion, getSourceConnectionIdLength(), retryRequired,
                 processorChain, () -> versionNegotiationStatus, log);
     }
 

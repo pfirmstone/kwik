@@ -26,12 +26,11 @@ import tech.kwik.core.crypto.ConnectionSecrets;
 import tech.kwik.core.crypto.MissingKeysException;
 import tech.kwik.core.log.Logger;
 import tech.kwik.core.log.NullLogger;
+import tech.kwik.core.tls.QuicTlsPort;
 
 import java.nio.ByteBuffer;
 import java.util.function.BiFunction;
 
-import static tech.kwik.core.common.EncryptionLevel.App;
-import static tech.kwik.core.common.EncryptionLevel.Handshake;
 import static tech.kwik.core.common.EncryptionLevel.Initial;
 
 /**
@@ -41,23 +40,23 @@ public class ClientRolePacketParser extends PacketParser {
 
     private volatile byte[] originalDestinationConnectionId;
 
-    public ClientRolePacketParser(ConnectionSecrets secrets, VersionHolder quicVersion, int cidLength, byte[] originalDestinationConnectionId, PacketFilter processor, BiFunction<ByteBuffer, Exception, Boolean> handleUnprotectPacketFailureFunction, Logger logger) {
-        super(secrets, quicVersion, cidLength, processor, handleUnprotectPacketFailureFunction, Role.Client, logger);
+    public ClientRolePacketParser(ConnectionSecrets secrets, QuicTlsPort tlsPort, VersionHolder quicVersion, int cidLength, byte[] originalDestinationConnectionId, PacketFilter processor, BiFunction<ByteBuffer, Exception, Boolean> handleUnprotectPacketFailureFunction, Logger logger) {
+        super(secrets, tlsPort, quicVersion, cidLength, processor, handleUnprotectPacketFailureFunction, Role.Client, logger);
         this.originalDestinationConnectionId = originalDestinationConnectionId;
     }
 
+    /**
+     * Get the AEAD to decrypt the given packet -- Initial/ZeroRTT only; Handshake/App are re-pointed
+     * to {@code QuicTlsPort} and never reach this method (see {@code PacketParser.parsePacket}'s
+     * branch, ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§6.1.2). The Handshake/App
+     * wrong-version-drop branch this method used to have is hoisted into {@code parsePacket} instead,
+     * since it no longer has an Aead lookup to piggyback on.
+     */
     @Override
     protected Aead getAead(QuicPacket packet, ByteBuffer data) throws MissingKeysException, InvalidPacketException {
         Aead aead;
         if (packet.getVersion().equals(quicVersion.getVersion())) {
             aead = connectionSecrets.getPeerAead(packet.getEncryptionLevel());
-        }
-        else if (packet.getEncryptionLevel() == App || packet.getEncryptionLevel() == Handshake) {
-            // https://www.rfc-editor.org/rfc/rfc9369.html#name-compatible-negotiation-requ
-            // "Both endpoints MUST send Handshake or 1-RTT packets using the negotiated version. An endpoint MUST
-            //  drop packets using any other version."
-            log.warn("Dropping packet not using negotiated version");
-            throw new InvalidPacketException("invalid version");
         }
         else if (packet.getEncryptionLevel() == Initial) {
             log.info(String.format("Receiving packet with version %s, while connection version is %s", packet.getVersion(), quicVersion));

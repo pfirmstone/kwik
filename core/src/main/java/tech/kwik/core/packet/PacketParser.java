@@ -18,12 +18,16 @@
  */
 package tech.kwik.core.packet;
 
+import jdk.internal.net.quic.QuicKeyUnavailableException;
+import jdk.internal.net.quic.QuicTLSEngine;
+import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.common.PnSpace;
 import tech.kwik.core.crypto.Aead;
 import tech.kwik.core.crypto.ConnectionSecrets;
 import tech.kwik.core.crypto.MissingKeysException;
 import tech.kwik.core.impl.*;
 import tech.kwik.core.log.Logger;
+import tech.kwik.core.tls.QuicTlsPort;
 
 import java.nio.ByteBuffer;
 import java.util.function.BiFunction;
@@ -31,6 +35,7 @@ import java.util.function.BiFunction;
 public abstract class PacketParser {
 
     protected ConnectionSecrets connectionSecrets;
+    protected QuicTlsPort tlsPort;
     protected VersionHolder quicVersion;
     protected final int cidLength;
     protected PacketFilter processorChain;
@@ -40,13 +45,14 @@ public abstract class PacketParser {
     private BiFunction<ByteBuffer, Exception, Boolean> handleUnprotectPacketFailureFunction;
 
 
-    public PacketParser(ConnectionSecrets secrets, VersionHolder quicVersion, int cidLength, PacketFilter processor, Role role, Logger logger) {
-        this(secrets, quicVersion, cidLength, processor, null, role, logger);
+    public PacketParser(ConnectionSecrets secrets, QuicTlsPort tlsPort, VersionHolder quicVersion, int cidLength, PacketFilter processor, Role role, Logger logger) {
+        this(secrets, tlsPort, quicVersion, cidLength, processor, null, role, logger);
     }
 
-    public PacketParser(ConnectionSecrets secrets, VersionHolder quicVersion, int cidLength, PacketFilter processor,
+    public PacketParser(ConnectionSecrets secrets, QuicTlsPort tlsPort, VersionHolder quicVersion, int cidLength, PacketFilter processor,
                         BiFunction<ByteBuffer, Exception, Boolean> handleUnprotectPacketFailure, Role role, Logger logger) {
         this.connectionSecrets = secrets;
+        this.tlsPort = tlsPort;
         this.quicVersion = quicVersion;
         this.cidLength = cidLength;
         processorChain = processor;
@@ -72,11 +78,18 @@ public abstract class PacketParser {
 
                 processorChain.processPacket(packet, new PacketMetaData(metaData, data.hasRemaining()));
             }
-            catch (DecryptionException | MissingKeysException cannotParse) {
+            catch (DecryptionException | MissingKeysException | QuicKeyUnavailableException cannotParse) {
                 // https://www.rfc-editor.org/rfc/rfc9000.html#name-coalescing-packets
                 // "For example, if decryption fails (because the keys are not available or for any other reason), the
                 //  receiver MAY either discard or buffer the packet for later processing and MUST attempt to process the
                 //  remaining packets."
+                // QuicKeyUnavailableException (thrown by the port-based Handshake/App parse path, see
+                // QuicPacket.parsePacketNumberAndPayload(..., QuicTlsPort, ...)) is this catch's
+                // port-based analogue of MissingKeysException for the legacy Aead path -- both mean
+                // "drop this packet, keys aren't ready" (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md
+                // §1.1). It falls into the generic (non-MissingKeysException) logging branch below,
+                // same as any other DecryptionException, rather than being force-fit into
+                // MissingKeysException's Cause enum, which this rewrite does not construct for it.
                 int nrOfPacketBytes = data.position();
                 if (nrOfPacketBytes == 0) {
                     // Nothing could be made out of it, so the whole datagram will be discarded
@@ -111,7 +124,7 @@ public abstract class PacketParser {
         }
     }
 
-    public QuicPacket parsePacket(ByteBuffer data) throws MissingKeysException, DecryptionException, InvalidPacketException, TransportError {
+    public QuicPacket parsePacket(ByteBuffer data) throws MissingKeysException, DecryptionException, InvalidPacketException, TransportError, QuicKeyUnavailableException {
         data.mark();
         if (data.remaining() < 2) {
             throw new InvalidPacketException("packet too short to be valid QUIC packet");
@@ -138,14 +151,35 @@ public abstract class PacketParser {
         }
         data.reset();
 
-        if (packet.getEncryptionLevel() != null) {
+        EncryptionLevel level = packet.getEncryptionLevel();
+        if (level == EncryptionLevel.Handshake || level == EncryptionLevel.App) {
+            // Handshake/App move to the port -- ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§6.1.2:
+            // getAead(...) is no longer called for these two levels at all (its Handshake/App branches,
+            // which only ever existed to reject wrong-version packets, are removed below and hoisted
+            // here instead, since that check is identical for both roles and no longer has an Aead
+            // lookup to piggyback on).
+            if (!packet.getVersion().equals(quicVersion.getVersion())) {
+                // https://www.rfc-editor.org/rfc/rfc9369.html#name-compatible-negotiation-requ
+                // "Both endpoints MUST send Handshake or 1-RTT packets using the negotiated version. An
+                //  endpoint MUST drop packets using any other version."
+                log.warn("Dropping packet not using negotiated version");
+                throw new InvalidPacketException("invalid version");
+            }
+            QuicTLSEngine.KeySpace keySpace = QuicTlsPort.toKeySpace(level);
+            long largestPN = packet.getPnSpace() != null ? largestPacketNumber[packet.getPnSpace().ordinal()] : 0;
+            packet.parse(data, tlsPort, largestPN, log, cidLength);
+        }
+        else if (level != null) {
+            // Initial / ZeroRTT: unchanged, still the legacy Aead/ConnectionSecrets path (§6.1.1/§6.1.2).
             Aead aead = getAead(packet, data);
             long largestPN = packet.getPnSpace() != null? largestPacketNumber[packet.getPnSpace().ordinal()]: 0;
             packet.parse(data, aead, largestPN, log, cidLength);
         }
         else {
-            // Packet has no encryption level, i.e. a VersionNegotiationPacket
-            packet.parse(data, null, 0, log, 0);
+            // Packet has no encryption level, i.e. a VersionNegotiationPacket -- always the Aead-taking
+            // overload (VersionNegotiationPacket never overrides the port-based one); explicit cast
+            // needed now that QuicPacket.parse is overloaded (Aead vs QuicTlsPort).
+            packet.parse(data, (Aead) null, 0, log, 0);
         }
 
         // Only retry packet and version negotiation packet won't have a packet number.

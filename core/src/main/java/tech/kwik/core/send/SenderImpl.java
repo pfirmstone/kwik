@@ -24,6 +24,9 @@ import tech.kwik.core.cc.CongestionController;
 import tech.kwik.core.cc.NewRenoCongestionController;
 import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.common.PnSpace;
+import jdk.internal.net.quic.QuicKeyUnavailableException;
+import jdk.internal.net.quic.QuicTLSEngine;
+import jdk.internal.net.quic.QuicTransportException;
 import tech.kwik.core.crypto.Aead;
 import tech.kwik.core.crypto.ConnectionSecrets;
 import tech.kwik.core.crypto.MissingKeysException;
@@ -39,6 +42,7 @@ import tech.kwik.core.packet.RetryPacket;
 import tech.kwik.core.packet.ShortHeaderPacket;
 import tech.kwik.core.recovery.RecoveryManager;
 import tech.kwik.core.recovery.RttEstimator;
+import tech.kwik.core.tls.QuicTlsPort;
 
 import java.io.IOException;
 import java.net.DatagramPacket;
@@ -99,6 +103,7 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
     private final Thread senderThread;
     private final boolean[] discardedSpaces = new boolean[PnSpace.values().length];
     private ConnectionSecrets connectionSecrets;
+    private QuicTlsPort tlsPort;
     private final Object condition = new Object();
     private boolean signalled;
 
@@ -170,7 +175,20 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
     }
 
     public void start(ConnectionSecrets secrets) {
+        this.start(secrets, null);
+    }
+
+    /**
+     * @param tlsPort port used for Handshake/App-level sends (§3/§6.1.2) -- nullable for now: no
+     *         production caller constructs a real per-connection port yet (that's the driver-seam,
+     *         SOW §3.3, not built by this step); a real connection reaching a Handshake/App send
+     *         before §3.3 lands will get a {@code NullPointerException} out of {@code send(...)}
+     *         below, which is an accurate reflection of "the wiring isn't finished yet", not a
+     *         silently-wrong result. See ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §8 Step B.
+     */
+    public void start(ConnectionSecrets secrets, QuicTlsPort tlsPort) {
         connectionSecrets = secrets;
+        this.tlsPort = tlsPort;
         senderThread.start();
     }
 
@@ -417,9 +435,19 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
             Iterator<SendItem> packetIterator = itemsToSend.iterator();
             while (packetIterator.hasNext()) {
                 QuicPacket packet = packetIterator.next().getPacket();
+                EncryptionLevel level = packet.getEncryptionLevel();
                 try {
-                    Aead aead = connectionSecrets.getOwnAead(packet.getEncryptionLevel());
-                    byte[] packetData = packet.generatePacketBytes(aead);
+                    byte[] packetData;
+                    if (level == EncryptionLevel.Handshake || level == EncryptionLevel.App) {
+                        // Handshake/App move to the port (§3/§6.1.2) -- ConnectionSecrets.getOwnAead is
+                        // no longer consulted for these two levels.
+                        packetData = packet.generatePacketBytes(tlsPort);
+                    }
+                    else {
+                        // Initial/ZeroRTT: unchanged, still the legacy Aead/ConnectionSecrets path.
+                        Aead aead = connectionSecrets.getOwnAead(level);
+                        packetData = packet.generatePacketBytes(aead);
+                    }
                     buffer.put(packetData);
                     log.raw("packet sent, pn: " + packet.getPacketNumber(), packetData);
                 }
@@ -431,6 +459,24 @@ public class SenderImpl implements Sender, CongestionControlEventListener {
                     else {
                         throw new IllegalStateException(e.getMessage());
                     }
+                }
+                catch (QuicKeyUnavailableException e) {
+                    // Port-based equivalent of MissingKeysException.Cause.DiscardedKeys above -- there
+                    // is no distinguishable "never installed" vs "discarded" signal on this exception
+                    // (see QuicPacket's port-based-protection note), so this mirrors the discarded-keys
+                    // handling (drop from the batch, keep sending the rest) rather than treating every
+                    // case as the IllegalStateException bug-signal branch above.
+                    log.warn("Packet not sent because keys are not available: " + packet + " (" + e.getMessage() + ")");
+                    packetIterator.remove();
+                }
+                catch (QuicTransportException e) {
+                    // e.g. AEAD confidentiality limit exceeded (QuicTLSEngine.encryptPacket's javadoc)
+                    // -- a real connection-ending condition RFC 9001 says should close the connection,
+                    // not just drop one packet. Proper handling is OQ-5/Step-C-adjacent follow-up work
+                    // (ADVICE doc §9/§10 OQ-5); conservatively dropping the packet here is a safe,
+                    // non-crashing default in the meantime, not a claim of full RFC conformance.
+                    log.error("Packet not sent due to QUIC-TLS engine transport error: " + packet + " (" + e.getMessage() + ")");
+                    packetIterator.remove();
                 }
             }
         }
