@@ -40,7 +40,6 @@ import tech.kwik.core.cid.ConnectionIdManager;
 import tech.kwik.core.client.CertificateSelector;
 import tech.kwik.core.common.PnSpace;
 import tech.kwik.core.crypto.CryptoStream;
-import tech.kwik.core.crypto.MissingKeysException;
 import tech.kwik.core.frame.*;
 import tech.kwik.core.log.Logger;
 import tech.kwik.core.log.NullLogger;
@@ -856,20 +855,36 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         }
     }
 
-    public void updateKeys() {
-        // https://tools.ietf.org/html/draft-ietf-quic-tls-31#section-6
-        // "Once the handshake is confirmed (see Section 4.1.2), an endpoint MAY initiate a key update."
-        if (handshakeState == HandshakeState.Confirmed) {
-            try {
-                connectionSecrets.getClientAead(App).computeKeyUpdate(true);
-            } catch (MissingKeysException e) {
-                throw new IllegalStateException(e);
-            }
-        }
-        else {
-            log.error("Refusing key update because handshake is not yet confirmed");
-        }
-    }
+    // updateKeys() -- public API that let a caller request a self-initiated 1-RTT key update
+    // (RFC 9001 §6: "Once the handshake is confirmed ..., an endpoint MAY initiate a key update.")
+    // -- was deleted here as part of the crypto-seam rewrite's Step C (key-update ratchet deletion).
+    //
+    // Why: the JDK QuicTLSEngine this fork now delegates all Handshake/App-level AEAD work to has no
+    // caller-triggerable self-initiated key update at all. Rollover is fully autonomous inside the
+    // engine, driven only by an internal ~80%-of-the-AEAD-confidentiality-limit heuristic on every
+    // encrypt call (QuicKeyManager.maybeInitiateKeyUpdate, confirmed by reading the engine's own
+    // implementation) -- there is no method on QuicTLSEngine, and none on the concrete
+    // QuicTLSEngineImpl beyond the interface either, to request "roll over the write keys now".
+    // Once kwik's own KeyUpdateSupport ratchet is gone (this same step), there is nothing left for
+    // this method to delegate to: it cannot be reimplemented against the port, only deleted or turned
+    // into a permanent no-op/exception, and a silent no-op would be worse than removal (a caller
+    // checking "did my key update happen" has no way to find out either way, but a compile error is at
+    // least honest about the capability being gone).
+    //
+    // This is a genuine, permanent capability loss, not an internal refactor -- see
+    // ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.4 (the finding) and §10 OQ-1 (board-recorded
+    // disposition: delete, with documentation, per this comment; option (a) of three considered).
+    // OQ-1's resolution cites the IETF quic-interop-runner's "keyupdate" test case as evidence this is
+    // safe for that specific interop check (it only requires *a* key update to happen somewhere in the
+    // connection, from either side, which the engine's autonomous trigger will still eventually
+    // produce) -- see the interop/InteropClient.java testKeyUpdate() call site update in this same
+    // commit for a case where that reasoning needed a second look: that test was written to *force* an
+    // early update (within the first MB, per the interop suite's own requirement), which this
+    // deletion means kwik can no longer do on demand. Flagged in this rewrite's report, not silently
+    // dropped.
+    //
+    // If this method was public API an external caller might have depended on, note that in release
+    // notes -- this deletion follows OQ-1's disposition, not a deprecation cycle.
 
     @Override
     public int getMaxShortHeaderPacketOverhead() {

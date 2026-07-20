@@ -490,9 +490,14 @@ abstract public class QuicPacket {
         nonceInput.putInt(0);
         nonceInput.putLong(packetNumber);
 
-        if (this instanceof ShortHeaderPacket) {
-            aead.checkKeyPhase(((ShortHeaderPacket) this).keyPhaseBit);
-        }
+        // The "if (this instanceof ShortHeaderPacket) { aead.checkKeyPhase(...) }" key-phase check
+        // that used to live here was already permanently unreachable as of Step B: ShortHeaderPacket
+        // now overrides parse(ByteBuffer, Aead, ...) to throw UnsupportedOperationException
+        // unconditionally (App/1-RTT uses the port-based path exclusively), so no ShortHeaderPacket
+        // instance ever reaches this Aead-taking overload. Deleted here per Step C
+        // (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.3/§8 Step C) rather than left dead.
+        // This overload remains in use by InitialPacket/ZeroRttPacket, which stay on the legacy
+        // Aead path permanently (§6.1.1/§6.1.2) and never carry a key phase.
 
         byte[] writeIV = aead.getIv();
         byte[] nonce = new byte[12];

@@ -99,25 +99,10 @@ public abstract class BaseAeadImpl implements Aead {
 
     protected abstract HKDF getHKDF();
 
-    @Override
-    public byte[] computeNextApplicationTrafficSecret() {
-        // https://www.rfc-editor.org/rfc/rfc9001.html#section-6.1
-        // "The endpoint creates a new write secret from the existing write secret as performed in Section 7.2 of [TLS13].
-        //  This uses the KDF function provided by TLS with a label of "quic ku". The corresponding key and IV are created
-        //  from that secret as defined in Section 5.1. The header protection key is not updated."
-        // https://www.rfc-editor.org/rfc/rfc9369.html#section-3.3.2
-        // "The labels used in [QUIC-TLS] to derive packet protection keys (Section 5.1), header protection keys (Section 5.4),
-        //  Retry Integrity Tag keys (Section 5.8), and key updates (Section 6.1) change from "quic key" to "quicv2 key",
-        //  from "quic iv" to "quicv2 iv", from "quic hp" to "quicv2 hp", and from "quic ku" to "quicv2 ku" "
-        String prefix = quicVersion.isV2()? QUIC_V2_KDF_LABEL_PREFIX: QUIC_V1_KDF_LABEL_PREFIX;
-
-        // https://datatracker.ietf.org/doc/html/rfc8446#section-7.2
-        // "The next-generation application_traffic_secret is computed as:
-        //  application_traffic_secret_N+1 = HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "", Hash.length)"
-        byte[] newApplicationTrafficSecret = hkdfExpandLabel(quicVersion, trafficSecret, prefix + "ku", "", getHashLength());
-        log.secret("Computed updated (next) ApplicationTrafficSecret (" + nodeRole.toString().toLowerCase() + "): ", newApplicationTrafficSecret);
-        return newApplicationTrafficSecret;
-    }
+    // computeNextApplicationTrafficSecret() (RFC 9001 §6.1's "quic ku"/"quicv2 ku" key-update HKDF
+    // expansion) was deleted here along with KeyUpdateSupport, its sole caller -- see
+    // ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.3/§6.1.1's addendum/§8 Step C. The engine
+    // now owns key-phase rollover entirely; nothing kwik-side computes a next traffic secret anymore.
 
     private void computeKeys(byte[] encryptionLevelSecret, boolean includeHP) {
         // https://www.rfc-editor.org/rfc/rfc9001.html#section-5.1

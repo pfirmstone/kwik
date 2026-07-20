@@ -482,8 +482,18 @@ public class InteractiveShell {
     }
 
     private void updateKeys(String arg) {
-        quicConnection.updateKeys();
-        quicConnection.ping();
+        // QuicClientConnectionImpl.updateKeys() (the self-initiated 1-RTT key update this command
+        // used to drive) was deleted as part of the crypto-seam rewrite's Step C: the JDK
+        // QuicTLSEngine this fork now delegates Handshake/App-level AEAD work to has no
+        // caller-triggerable self-initiated key update at all -- rollover is fully autonomous inside
+        // the engine (see QuicClientConnectionImpl's own comment at the former updateKeys() call site,
+        // and ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.4/§10 OQ-1). Kept as a registered
+        // command (rather than removed from the `commands` map) so a user typing "update_keys" gets an
+        // explanation instead of "unknown command".
+        System.out.println("update_keys is no longer available: self-initiated key update has no " +
+                "equivalent on the JDK QuicTLSEngine this build uses -- key-phase rollover is fully " +
+                "autonomous inside the engine now, not caller-triggerable. " +
+                "See ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.4/§10 OQ-1.");
     }
 
     private void quack(String s) {

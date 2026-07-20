@@ -35,48 +35,16 @@ public interface Aead {
 
     byte[] aeadDecrypt(byte[] associatedData, byte[] message, byte[] nonce) throws DecryptionException;
 
-    /**
-     * Check whether the key phase carried by a received packet still matches the current key phase; if not, compute
-     * new keys (to be used for decryption). Note that the changed key phase can also be caused by packet corruption,
-     * so it is not yet sure whether a key update is really in progress (this will be sure when decryption of the packet
-     * failed or succeeded).
-     * @param keyPhaseBit
-     */
-    default void checkKeyPhase(short keyPhaseBit) {}
-
-    /**
-     * Compute new keys.
-     * @param selfInitiated        true when this role initiated the key update, so updating write secrets.
-     */
-    default void computeKeyUpdate(boolean selfInitiated) {}
-
-    /**
-     * Compute the next application traffic secret for a key update.
-     * @return
-     */
-    byte[] computeNextApplicationTrafficSecret();
-
-    /**
-     * Confirm that, if a key update was in progress, it has been successful and thus the new keys can (and should) be
-     * used for decrypting all incoming packets.
-     */
-    default void confirmKeyUpdateIfInProgress() {}
-
-    /**
-     * Confirm that, if a key update was in progress, it has been unsuccessful and thus the new keys should not be
-     * used for decrypting all incoming packets.
-     */
-    default void cancelKeyUpdateIfInProgress() {}
-
-    default short getKeyPhase() {
-        return 0;
-    }
-
-    default int getKeyUpdateCounter() {
-        return 0;
-    }
-
-    default void setPeerAead(Aead peerAead) {}
+    // Key-update ratchet methods (checkKeyPhase/computeKeyUpdate/computeNextApplicationTrafficSecret/
+    // confirmKeyUpdateIfInProgress/cancelKeyUpdateIfInProgress/getKeyPhase/getKeyUpdateCounter/
+    // setPeerAead) were deleted here: kwik no longer tracks or drives key-phase state itself for
+    // Handshake/App-level traffic (both moved to QuicTlsPort/QuicTLSEngine in Step B). The engine
+    // owns key-phase rollover -- both peer-initiated (speculative "next key" decrypt, confirm/cancel
+    // on success/failure) and self-initiated (autonomous, at ~80% of the AEAD confidentiality limit,
+    // not caller-triggerable) -- entirely internally; there is no kwik-side state left to check,
+    // compute, confirm, or cancel. See ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.2/§2.3/§8
+    // Step C. This interface (and Aes128Gcm/Aes256Gcm/ChaCha20/BaseAeadImpl below it) survives for
+    // Initial/0-RTT use only, per §6.1.1/§6.1.2 -- neither of which ever used the ratchet.
 
     byte[] getTrafficSecret();
 

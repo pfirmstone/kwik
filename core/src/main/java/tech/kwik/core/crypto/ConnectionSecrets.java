@@ -192,15 +192,12 @@ public class ConnectionSecrets {
             serverAead = aeadFactory.apply(Role.Server, serverHandshakeTrafficSecret, null);
         }
 
-        if (level == EncryptionLevel.App) {
-            assert (clientAead != null) && (serverAead != null);
-            // Wrap Aead with KeyUpdateSupport to support key updates (only allowed on 1-RTT/App level)
-            clientAead = new KeyUpdateSupport(clientAead, Role.Client, aeadFactory, log);
-            serverAead = new KeyUpdateSupport(serverAead, Role.Server, aeadFactory, log);
-            // Keys for peer and keys for self must be able to signal each other of a key update.
-            clientAead.setPeerAead(serverAead);
-            serverAead.setPeerAead(clientAead);
-        }
+        // Pre-Step-C, the App-level branch here wrapped both Aeads in KeyUpdateSupport and
+        // cross-registered them via setPeerAead to support kwik's own key-update ratchet. That's gone:
+        // App-level (1-RTT) traffic moved to QuicTlsPort/QuicTLSEngine in Step B, which owns key-phase
+        // rollover internally now (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.2/§2.3). This
+        // method is only ever called with Initial/ZeroRTT after Step B/C (§6.1.2) -- neither needs a
+        // ratchet -- so clientAead/serverAead are set directly, plain, below.
 
         clientSecrets.set(level.ordinal(), clientAead);
         serverSecrets.set(level.ordinal(), serverAead);

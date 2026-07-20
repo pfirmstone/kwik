@@ -293,6 +293,34 @@ public class InteropClient {
     }
 
     private static void testKeyUpdate(List<URL> downloadUrls, QuicClientConnectionImpl.Builder builder) throws IOException {
+        // CAPABILITY LOSS (crypto-seam rewrite, Step C -- ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md
+        // §2.4/§10 OQ-1): this method used to call QuicClientConnectionImpl.updateKeys() here,
+        // immediately after the first ~100KB, specifically because the IETF quic-interop-runner's
+        // "keyupdate" test case requires the update to happen early -- "during the first MB
+        // transferred" (quic-interop-runner's own quic.md wording) -- not merely "at some point in the
+        // connection". That on-demand trigger no longer exists: the JDK QuicTLSEngine this fork now
+        // delegates to has no caller-triggerable self-initiated key update at all (it rolls over
+        // autonomously, only at ~80% of the AEAD confidentiality limit -- on the order of millions of
+        // packets, i.e. far more than 1MB of HTTP/0.9 download traffic).
+        //
+        // Practical effect: this test case can no longer reliably force a key update within the
+        // interop suite's required window by calling into kwik directly. OQ-1's board-recorded
+        // disposition ("delete updateKeys(), document the loss") cited this same interop test as
+        // evidence the deletion was *safe*, reasoning that the engine will still eventually produce
+        // *some* key update during a long-lived connection and "it doesn't matter which peer actually
+        // initiated the update" per the suite's own description -- but that reasoning addressed
+        // whether *a* key update ever occurs, not whether one occurs within the suite's specific
+        // "first MB" timing requirement, which this call site exists specifically to satisfy and can
+        // no longer guarantee. Flagged as a genuine, not merely hypothetical, capability loss --
+        // this is the concrete in-repo case OQ-1's own "unless a board reviewer knows of an
+        // interop-test requirement" carve-out was about. See this rewrite's Step C report.
+        //
+        // No kwik-side substitute exists to restore this test case's timing guarantee (no engine API
+        // to influence the confidentiality-limit trigger was found -- OQ-1 option (c)). Left as a
+        // plain, uninterrupted download so the interop harness at least doesn't fail to *compile* or
+        // *run*; whether the "keyupdate" test case as a whole still passes now depends entirely on
+        // whether the engine's autonomous trigger happens to fire during this transfer, which for a
+        // download this size it will not.
         logger.logPackets(true);
         logger.info("Starting download at " + timeNow());
 
@@ -308,12 +336,6 @@ public class InteropClient {
 
         String fileName = requestPath;
         FileOutputStream  out = new FileOutputStream(new File(outputFile, fileName));
-        // Read the first 100KB of bytes (approx.)
-        transfer(httpStream.getInputStream(), out, 100 * 1024);
-        // Initiate the key update; test specification requires the update to take place before 1MB is downloaded.
-        logger.info("Initiating key update");
-        ((QuicClientConnectionImpl) connection).updateKeys();
-        // And download the rest.
         httpStream.getInputStream().transferTo(out);
         logger.info("Downloaded " + downloadUrls.get(0) + " finished at " + timeNow());
     }

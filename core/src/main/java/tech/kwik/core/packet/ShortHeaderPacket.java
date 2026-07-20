@@ -77,8 +77,8 @@ public class ShortHeaderPacket extends QuicPacket {
         // method's former key-update ratchet call sites (aead.confirmKeyUpdateIfInProgress() /
         // aead.cancelKeyUpdateIfInProgress()) as a side effect: the engine owns key-phase state
         // internally now (§2.2/§2.3) and there is no port-equivalent call to translate them to.
-        // KeyUpdateSupport.java itself is left in place, as now-dead code, for Step C to delete
-        // deliberately and in isolation (§8 Step C) -- not deleted here.
+        // KeyUpdateSupport.java itself (plus Aead's ratchet default methods) was deleted separately,
+        // in Step C, per this plan (§8 Step C) -- not deleted here in Step B.
         throw new UnsupportedOperationException(
                 "ShortHeaderPacket uses the port-based protection path (QuicTLSEngine.KeySpace.ONE_RTT); " +
                 "see parse(ByteBuffer, QuicTlsPort, long, Logger, int). " +
