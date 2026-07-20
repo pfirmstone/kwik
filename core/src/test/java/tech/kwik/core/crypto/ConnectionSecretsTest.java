@@ -34,7 +34,7 @@ class ConnectionSecretsTest {
     @Test
     void whenKeysAreNotSetExceptionCauseIsMissing() {
         // Given
-        var connectionSecrets = new ConnectionSecrets(new VersionHolder(Version.getDefault()), Role.Client, null, mock(Logger.class));
+        var connectionSecrets = new ConnectionSecrets(new VersionHolder(Version.getDefault()), Role.Client, mock(Logger.class));
         connectionSecrets.computeInitialKeys(new byte[8]);
 
         // When
@@ -49,7 +49,7 @@ class ConnectionSecretsTest {
     @Test
     void whenKeysAreSetButDiscardedExceptionCauseIsDiscarded() {
         // Given
-        var connectionSecrets = new ConnectionSecrets(new VersionHolder(Version.getDefault()), Role.Client, null, mock(Logger.class));
+        var connectionSecrets = new ConnectionSecrets(new VersionHolder(Version.getDefault()), Role.Client, mock(Logger.class));
         connectionSecrets.computeInitialKeys(new byte[8]);
 
         // When

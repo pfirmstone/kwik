@@ -286,7 +286,6 @@ Usage of the sample client:
         --reservedVersion           use reserved version to trigger version
      -S,--storeTickets <arg>        basename of file to store new session tickets
         --saveServerCertificates <arg>   store server certificates in given file
-        --secrets <arg>             write secrets to file (Wireshark format)
      -T,--relativeTime              log with time (in seconds) since first packet 
      -v,--version                   show Kwik version
      -v1                            use Quic version 1           

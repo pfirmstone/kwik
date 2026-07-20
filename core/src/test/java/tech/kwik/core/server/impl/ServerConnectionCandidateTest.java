@@ -456,7 +456,7 @@ class ServerConnectionCandidateTest {
     byte[] createInitialPacketBytes(Version version, byte[] scid, byte[] odcid, int packetNumber, List<QuicFrame> frames) throws Exception {
         InitialPacket initialPacket = new InitialPacket(version, scid, odcid, null, frames);
         initialPacket.setPacketNumber(packetNumber);
-        ConnectionSecrets secrets = new ConnectionSecrets(VersionHolder.with(version), Role.Client, null, mock(Logger.class));
+        ConnectionSecrets secrets = new ConnectionSecrets(VersionHolder.with(version), Role.Client, mock(Logger.class));
         secrets.computeInitialKeys(odcid);
         return initialPacket.generatePacketBytes(secrets.getOwnAead(EncryptionLevel.Initial));
     }

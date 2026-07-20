@@ -29,7 +29,6 @@ import tech.kwik.core.log.Logger;
 import tech.kwik.core.util.Bytes;
 import tech.kwik.core.util.TriFunction;
 
-import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReferenceArray;
@@ -68,20 +67,12 @@ public class ConnectionSecrets {
     private final AtomicBoolean[] discarded = new AtomicBoolean[EncryptionLevel.values().length];
 
 
-    // The wiresharksecrets parameter is retained, unused, per this rewrite's Step D scope
-    // (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §6.1.2/§11 item 30): the constructor's own row
-    // in §6.1.2's method table says "unchanged," and changing this signature would ripple into every
-    // one of this class's ~15 construction sites (production and test) for no scope-mandated reason.
-    // What did change: the Wireshark secrets-file export machinery this parameter used to feed
-    // (writeSecretsToFile/wiresharkSecretsFile fields, appendToFile(...)) is deleted along with
-    // computeHandshakeSecrets/computeApplicationSecrets, its only callers -- neither computeInitialKeys
-    // nor computeEarlySecrets (the two methods that survive) ever wrote to this file. A caller that
-    // passes a non-null path here (QuicClientConnection.Builder.secrets(Path) / the CLI's -secrets
-    // flag) now gets no error and no file: the option is silently inert. This is a real, if narrow,
-    // capability loss/UX regression beyond what the ADVICE doc's own "worth one line in release notes"
-    // framing anticipated for the Handshake/App secrets export -- flagged for board/Peter attention
-    // rather than silently accepted, since the doc did not analyze this call site.
-    public ConnectionSecrets(VersionHolder quicVersion, Role role, Path wiresharksecrets, Logger log) {
+    // Peter's decision 2026-07-21 (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §11 item 33):
+    // Step D (commit 536666c3) deleted the Wireshark secrets-file export machinery this parameter used
+    // to feed, leaving QuicClientConnection.Builder.secrets(Path) and the CLI's -secrets flag as silent
+    // no-ops (§11 item 30). Rather than leave a silently-ignored public API, the parameter and both
+    // call-in surfaces are removed outright here.
+    public ConnectionSecrets(VersionHolder quicVersion, Role role, Logger log) {
         this.quicVersion = quicVersion;
         this.ownRole = role;
         this.log = log;

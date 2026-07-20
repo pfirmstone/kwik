@@ -62,7 +62,6 @@ import javax.net.ssl.X509TrustManager;
 import java.io.IOException;
 import java.net.*;
 import java.nio.ByteBuffer;
-import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
@@ -162,11 +161,11 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
     private QuicClientConnectionImpl(String host, int port, InetTools.IPversionOption ipVersionOption, String applicationProtocol, long connectTimeout,
                                      ClientConnectionConfig connectionProperties, QuicSessionTicket sessionTicket,
                                      Version originalVersion, Version preferredVersion, Logger log,
-                                     String proxyHost, Path secretsFile, Integer initialRtt, Integer cidLength,
+                                     String proxyHost, Integer initialRtt, Integer cidLength,
                                      List<TlsConstants.CipherSuite> cipherSuites,
                                      X509Certificate clientCertificate, PrivateKey clientCertificateKey,
                                      DatagramSocketFactory socketFactory) throws UnknownHostException, SocketException {
-        super(originalVersion, Role.Client, secretsFile, connectionProperties, "", log);
+        super(originalVersion, Role.Client, connectionProperties, "", log);
         this.applicationProtocol = applicationProtocol;
         this.connectTimeout = connectTimeout;
         this.connectionProperties = connectionProperties;
@@ -1388,7 +1387,6 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         private QuicVersion preferredVersion;
         private Logger log = new NullLogger();
         private String proxyHost;
-        private Path secretsFile;
         private Integer initialRtt;
         private Integer connectionIdLength;
         private List<TlsConstants.CipherSuite> cipherSuites = new ArrayList<>();
@@ -1426,7 +1424,7 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
 
             QuicClientConnectionImpl quicConnection =
                     new QuicClientConnectionImpl(host, port, ipVersionOption, applicationProtocol, connectTimeoutInMillis, connectionProperties, sessionTicket, Version.of(quicVersion),
-                            Version.of(preferredVersion), log, proxyHost, secretsFile, initialRtt, connectionIdLength,
+                            Version.of(preferredVersion), log, proxyHost, initialRtt, connectionIdLength,
                             cipherSuites, clientCertificate, clientCertificateKey, socketFactory);
 
             if (omitCertificateCheck) {
@@ -1581,12 +1579,6 @@ public class QuicClientConnectionImpl extends QuicConnectionImpl implements Quic
         @Override
         public Builder proxy(String host) {
             proxyHost = host;
-            return this;
-        }
-
-        @Override
-        public Builder secrets(Path secretsFile) {
-            this.secretsFile = secretsFile;
             return this;
         }
 

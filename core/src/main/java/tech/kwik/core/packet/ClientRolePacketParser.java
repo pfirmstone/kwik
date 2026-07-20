@@ -61,7 +61,7 @@ public class ClientRolePacketParser extends PacketParser {
         else if (packet.getEncryptionLevel() == Initial) {
             log.info(String.format("Receiving packet with version %s, while connection version is %s", packet.getVersion(), quicVersion));
             // Need other secrets to decrypt packet; when version negotiation succeeds, connection version will be adapted.
-            ConnectionSecrets altSecrets = new ConnectionSecrets(new VersionHolder(packet.getVersion()), Role.Client, null, new NullLogger());
+            ConnectionSecrets altSecrets = new ConnectionSecrets(new VersionHolder(packet.getVersion()), Role.Client, new NullLogger());
             altSecrets.computeInitialKeys(originalDestinationConnectionId);
             aead = altSecrets.getPeerAead(packet.getEncryptionLevel());
         }

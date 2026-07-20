@@ -432,7 +432,7 @@ class ServerConnectorImplTest {
     private boolean isInitialWithConnectionCloseFrameWithError(byte[] packetBytes, byte[] dcid, int expectedError) {
         try {
             InitialPacket initialPacket = new InitialPacket(Version.getDefault());
-            ConnectionSecrets secrets = new ConnectionSecrets(VersionHolder.with(Version.getDefault()), Role.Client, null, mock(Logger.class));
+            ConnectionSecrets secrets = new ConnectionSecrets(VersionHolder.with(Version.getDefault()), Role.Client, mock(Logger.class));
             secrets.computeInitialKeys(dcid);
             initialPacket.parse(ByteBuffer.wrap(packetBytes), secrets.getPeerAead(EncryptionLevel.Initial), 0, mock(Logger.class), 0);
             return initialPacket.getFrames().stream()

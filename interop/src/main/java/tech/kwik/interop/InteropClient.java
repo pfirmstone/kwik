@@ -121,11 +121,6 @@ public class InteropClient {
             builder.logger(logger);
             builder.initialRtt(100);
             builder.connectTimeout(Duration.ofSeconds(30));
-            String keylogfileEnvVar = System.getenv("SSLKEYLOGFILE");
-            if (keylogfileEnvVar != null && ! keylogfileEnvVar.isBlank()) {
-                System.out.println("Writing keys to " + keylogfileEnvVar);
-                builder.secrets(Paths.get(keylogfileEnvVar));
-            }
 
             if (testCase.equals(TC_TRANSFER)) {
                 testTransfer(downloadUrls, builder);

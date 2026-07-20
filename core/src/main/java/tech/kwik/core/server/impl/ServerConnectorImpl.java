@@ -381,7 +381,7 @@ public class ServerConnectorImpl implements ServerConnector {
         InitialPacket connectionRefusedResponse = new InitialPacket(version, dcid, scid, null, connectionClosed);
         connectionRefusedResponse.setPacketNumber(0);
 
-        ConnectionSecrets connectionSecrets = new ConnectionSecrets(VersionHolder.with(version), Role.Server, null, log);
+        ConnectionSecrets connectionSecrets = new ConnectionSecrets(VersionHolder.with(version), Role.Server, log);
         connectionSecrets.computeInitialKeys(dcid);
         try {
             sendPacket(clientAddress, connectionRefusedResponse, connectionSecrets.getOwnAead(Initial));

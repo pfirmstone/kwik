@@ -363,7 +363,7 @@ public class ServerConnectionCandidate implements ServerConnectionProxy, Datagra
         // "An Initial packet uses long headers with a type value of 0x0."
         if (InitialPacket.isInitialType((flags & 0x30) >> 4, quicVersion)) {
             InitialPacket packet = new InitialPacket(quicVersion);
-            ConnectionSecrets connectionSecrets = new ConnectionSecrets(new VersionHolder(quicVersion), Role.Server, null, new NullLogger());
+            ConnectionSecrets connectionSecrets = new ConnectionSecrets(new VersionHolder(quicVersion), Role.Server, new NullLogger());
             byte[] originalDcid = dcid;
             connectionSecrets.computeInitialKeys(originalDcid);
             try {

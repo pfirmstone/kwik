@@ -146,8 +146,6 @@ public class KwikCli {
 
         String outputFile = extractOutputFile(cmd);
 
-        processSecretsArgs(cmd, connectionBuilder);
-
         processSessionTicketSaveArg(cmd, connectionBuilder);
 
         boolean useSessionTicket = processSessionTicketArg(cmd, connectionBuilder);
@@ -441,19 +439,6 @@ public class KwikCli {
             }
         }
         return outputFile;
-    }
-
-    private void processSecretsArgs(CommandLine cmd, QuicClientConnection.Builder builder) {
-        if (cmd.hasOption("secrets")) {
-            String secretsFile = cmd.getOptionValue("secrets");
-            if (secretsFile == null) {
-                throw new IllegalArgumentException("Missing argument for option -secrets");
-            }
-            if (Files.exists(Paths.get(secretsFile)) && !Files.isWritable(Paths.get(secretsFile))) {
-                throw new IllegalArgumentException("Secrets file '" + secretsFile + "' is not writable.");
-            }
-            builder.secrets(Paths.get(secretsFile));
-        }
     }
 
     private void processSessionTicketSaveArg(CommandLine cmd, QuicClientConnection.Builder builder) {
@@ -861,7 +846,6 @@ public class KwikCli {
         cmdLineOptions.addOption("S", "storeTickets", true, "basename of file to store new session tickets");
         cmdLineOptions.addOption("T", "relativeTime", false, "log with time (in seconds) since first packet");
         cmdLineOptions.addOption("Z", "use0RTT", false, "use 0-RTT if possible (requires -H)");
-        cmdLineOptions.addOption(null, "secrets", true, "write secrets to file (Wireshark format)");
         cmdLineOptions.addOption("v", "version", false, "show Kwik version");
         cmdLineOptions.addOption(null, "initialRtt", true, "custom initial RTT value (default is 500)");
         cmdLineOptions.addOption(null, "chacha20", false, "use ChaCha20 as only cipher suite");

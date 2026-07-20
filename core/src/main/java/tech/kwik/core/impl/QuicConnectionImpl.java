@@ -43,7 +43,6 @@ import tech.kwik.core.util.ProgressivelyIncreasingRateLimiter;
 import tech.kwik.core.util.RateLimiter;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -163,7 +162,7 @@ public abstract class QuicConnectionImpl implements QuicConnection, PacketProces
     private volatile ExecutorService datagramHandlerExecutor;
 
 
-    protected QuicConnectionImpl(Version originalVersion, Role role, Path secretsFile, ConnectionConfig settings, String id, Logger log) {
+    protected QuicConnectionImpl(Version originalVersion, Role role, ConnectionConfig settings, String id, Logger log) {
         this.quicVersion = new VersionHolder(originalVersion);
         this.role = role;
         this.log = log;
@@ -171,7 +170,7 @@ public abstract class QuicConnectionImpl implements QuicConnection, PacketProces
 
         processorChain = createProcessorChain();
 
-        connectionSecrets = new ConnectionSecrets(quicVersion, role, secretsFile, log);
+        connectionSecrets = new ConnectionSecrets(quicVersion, role, log);
 
         connectionState = Status.Created;
         closeFramesSendRateLimiter = new ProgressivelyIncreasingRateLimiter();

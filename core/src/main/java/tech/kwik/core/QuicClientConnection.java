@@ -29,7 +29,6 @@ import java.net.InetSocketAddress;
 import java.net.SocketException;
 import java.net.URI;
 import java.net.UnknownHostException;
-import java.nio.file.Path;
 import java.security.KeyStore;
 import java.security.PrivateKey;
 import java.security.cert.X509Certificate;
@@ -118,8 +117,6 @@ public interface QuicClientConnection extends QuicConnection {
         Builder sessionTicket(byte[] ticketData);
 
         Builder proxy(String host);
-
-        Builder secrets(Path secretsFile);
 
         Builder uri(URI uri);
 

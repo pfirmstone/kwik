@@ -2049,7 +2049,9 @@ Step D was actually executed, not just planned):**
     file. §6.1.2's own framing of the `appendToFile` deletion ("worth one line in release notes") did
     not anticipate that the loss would surface as a still-live, silently-inert public option rather than
     a removed one. Left as found (adding new warning/error/deprecation logic would be redesign, out of
-    Step D's remit) and flagged here for board/Peter attention. (b) `computeHandshakeSecrets`/
+    Step D's remit) and flagged here for board/Peter attention. **RESOLVED-BY-REMOVAL, 2026-07-21: per
+    Peter's decision, both silently-inert surfaces are deleted outright rather than left as no-ops — see
+    §11 item 33.** (b) `computeHandshakeSecrets`/
     `computeApplicationSecrets` had two real production call-site pairs —
     `QuicClientConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()` and
     `ServerConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()`, all four still driven by the
@@ -2080,3 +2082,31 @@ Step D was actually executed, not just planned):**
     revision records (items 30-31) are both blast-radius/staleness gaps in the document's own supporting
     text, not gaps in §6.1.2's `ConnectionSecrets`-internal survivor/delete list itself, which needed no
     correction (§8, Step D's "DONE" box).
+
+**Added 2026-07-21, following Peter's decision on item 30's flagged finding (branch
+`fix/remove-secrets-builder-flag`, 1 commit, not pushed):**
+
+33. **Item 30's silently-inert public API (`QuicClientConnection.Builder.secrets(Path)`, the CLI's
+    `-secrets` flag) is removed outright rather than left as a silent no-op.** Peter's call: a public
+    option that accepts input, returns success, and does nothing is worse than no option at all — it
+    fails silently instead of failing loudly, and nothing in this fork's SOW commits to keeping it (the
+    SOW's core non-goal is explicit that "traffic secrets never leave the engine" in this fork, so a
+    working replacement was never on the table either). Removed: the `secrets(Path)` method from
+    `QuicClientConnection.Builder` and its `BuilderImpl`/field in `QuicClientConnectionImpl`; the now-dead
+    `Path wiresharksecrets`/`secretsFile` parameter threaded through `ConnectionSecrets`'s constructor,
+    `QuicConnectionImpl`'s constructor, and all ~15 `new ConnectionSecrets(...)` call sites (production
+    and test — all dropped the argument, not replaced with anything, since the parameter carried no
+    behavior after Step D); the CLI's `-secrets` option registration and `processSecretsArgs` in
+    `KwikCli.java`; `InteropClient.java`'s `SSLKEYLOGFILE`-driven `builder.secrets(...)` call (the interop
+    harness's own use of the now-deleted method); and the `readme.md` `--secrets` help-text line (the
+    fork's own CLI usage documentation, not upstream prose). No server-side equivalent existed to remove
+    (`ServerConnectionConfig.Builder`/`ServerConnector.Builder` never had a `secrets`/`Path` parameter —
+    confirmed by grep, not assumed). Verified clean: `clean :kwik:test` → 997/994/0/3, identical to the
+    Step D baseline, zero test deltas (no test exercised the removed API directly — all ~15 changed test
+    call sites were incidental positional-argument drops, not tests *of* the secrets feature);
+    `:kwik:keyLimitsRolloverTest` → 3/3; whole-reactor `build` → `BUILD SUCCESSFUL`, all six subprojects;
+    `git diff master -- InitialPacket.java ZeroRttPacket.java RetryPacket.java
+    VersionNegotiationPacket.java` → empty. This is a **deliberate fork API divergence from upstream
+    `ptrd/kwik`**, which keeps Wireshark keylog support — a future upstream merge touching
+    `ConnectionSecrets`'s constructor signature or `QuicClientConnection.Builder` will conflict here by
+    design, not by accident.
