@@ -1381,6 +1381,105 @@ retention in `ConnectionSecrets` was implemented incorrectly. (By this point, `c
 `App`-level `KeyUpdateSupport` wrapping has already been removed in Step C per the correction above
 — Step D's `ConnectionSecrets` diff is the rest of the file's Handshake/App-only material.)
 
+**DONE, 2026-07-21, branch `impl/crypto-seam-step-d-connectionsecrets-cleanup` (isolated worktree,
+1 production commit `536666c3`, not pushed).** Summary below; the rest of this Step D entry (above
+this box) is left as-is as the historical planning record, per this document's own convention —
+read it for the *plan*, read this box for what actually happened and where it differed.
+
+- **`ConnectionSecrets.java` reduced exactly to §6.1.2's spec, verified field-by-field/method-by-method
+  against the table, not assumed from the doc's own list.** Deleted: `computeHandshakeSecrets`,
+  `computeApplicationSecrets`, the `selectedCipherSuite` field, `appendToFile`, `writeSecretsToFile`,
+  `wiresharkSecretsFile`. Survived unchanged: constructor (see correction below), `computeInitialKeys`,
+  `recomputeInitialKeys(byte[])`/`recomputeInitialKeys()`, `getInitialPeerSecretsForVersion`,
+  `computeInitialSecret`, `computeEarlySecrets`, `createKeys` (already narrowed in Step C),
+  `setClientRandom`, `getClientAead`/`getServerAead`/`getPeerAead`/`getOwnAead`,
+  `getOriginalClientInitialAead`, `checkNotNull`, `discardKeys`. Five now-unused imports removed
+  (`java.io.IOException`, `java.nio.file.Files`, `java.nio.file.StandardOpenOption`, `java.util.ArrayList`,
+  `java.util.List`); `tech.kwik.core.util.Bytes` was also removed, since its only caller was
+  `appendToFile` and an unused import is exactly the kind of thing a reviewer would flag. `at.favre.lib.hkdf` (`HKDF`
+  import) and `Path`/`Arrays`/`AtomicBoolean`/`AtomicReferenceArray` all remain, still genuinely used.
+- **Reconciliation against §6.1.2's field/method table: zero deviations found once the file was
+  re-read in full against it** — every "yes, unchanged" row is unchanged; every "deleted" row is
+  deleted; the two "dead, implementer's call, lean toward deleting" fields
+  (`writeSecretsToFile`/`wiresharkSecretsFile`) were deleted, taking the lean-toward option.
+- **Correction — the constructor's own "yes, unchanged" row undercounted the fallout, and a real gap
+  in the doc's blast-radius analysis was found executing this, not anticipated by planning it.** Two
+  distinct findings, both new, both added to §11 below (items 30-32) rather than silently patched:
+  1. **(§11 item 30)** The constructor body (`if (wiresharksecrets != null) { ... Files.createFile ...
+     mustWriteSecretsToFile = true ... } else { wiresharkSecretsFile = null; } writeSecretsToFile =
+     mustWriteSecretsToFile;`) exists only to populate the two now-deleted fields, so it had to go too
+     — the constructor's *signature* is unchanged (all ~15 construction sites, production and test,
+     compile and pass unmodified, matching the table's intent), but its *body* is not byte-identical,
+     contrary to a literal reading of "unchanged." The `wiresharksecrets` `Path` parameter is kept,
+     now silently unused: `QuicClientConnection.Builder.secrets(Path)` and the CLI's `-secrets` flag
+     both still accept a path and now write nothing to it, with no error or warning raised anywhere in
+     the call chain (`QuicConnectionImpl` → `ConnectionSecrets`). This is a real, if narrow, capability
+     loss/UX regression the doc's own "worth one line in release notes" framing (§6.1.2's `appendToFile`
+     entry) did not fully anticipate — it framed the loss as "no more Wireshark secrets-file export,"
+     not "a still-present, still-documented CLI flag/builder option that silently does nothing." Left
+     exactly as found (no new logging/error/deprecation added — that would be redesign, out of this
+     step's remit) and flagged here for board/Peter attention rather than silently accepted.
+  2. **(§11 item 30, continued)** `computeHandshakeSecrets`/`computeApplicationSecrets` turned out to
+     have two real, live production call-site pairs the doc's blast-radius tables (§6.1.2's "call-site
+     confirmation," §7.1) never examined, because those tables only ever audited call sites of the
+     *surviving* methods: `QuicClientConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()`
+     (lines 591/624 pre-edit) and `ServerConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()`
+     (lines 287/294 pre-edit) — both still driven by the pre-§3.3 legacy `TlsClientEngine`/
+     `TlsServerEngine` handshake path (Step B's nullable `tlsPort` field is not populated by anything
+     yet, per Step B's own "DONE" box). Deleting the two `ConnectionSecrets` methods without also
+     editing these four call sites would not compile. **Verified safe to simply remove the four calls
+     (not replace them with anything) before doing so, not assumed**: grepped every production caller
+     of `getClientAead`/`getServerAead`/`getPeerAead`/`getOwnAead` and confirmed
+     `ClientRolePacketParser.getAead`/`ServerRolePacketParser.getAead`/`SenderImpl.send` all branch
+     `Handshake`/`App` to `QuicTlsPort` and never reach `ConnectionSecrets` for those two levels (their
+     own javadoc/comments say so explicitly, added in Step B) — so the `Aead`s these two deleted methods
+     used to compute and store at the `Handshake`/`App` ordinals of `clientSecrets`/`serverSecrets` were
+     already write-only dead data since Step B, with no reader anywhere. Removed the four calls, added
+     an explanatory comment at each site citing this document.
+- **Test suite: 997 tests, 994 successes, 0 failures, 3 skipped — unchanged from the Step C baseline,
+  no deltas to account for.** This is a real, verified finding, not an assumption: the §7.2 "7-file
+  test fixture migration" this step's own planning paragraph (above this box) called out as "unchanged
+  in count and shape by this correction" turned out to be **stale** — Step B's own "DONE" box (already
+  in this document) already migrated 5 of the 7 files (`HandshakePacketTest.java`,
+  `ShortHeaderPacketTest.java`, `SenderImplTest.java`, `PacketAssemblerTest.java`,
+  `AbstractSenderTest.java`) as a forced side effect of its production rewrite, and the remaining 2
+  (`InitialPacketTest.java`, `ZeroRttPacketTest.java`) needed **zero changes**, not a migration: both
+  still use `TestUtils.createKeys()`/`CryptoTestUtils.createKeys()`, which mocks a real `Aes128Gcm`
+  directly — a class this step's own survivor list keeps unchanged, so the fixture never depended on
+  anything this step deleted. Repo-wide grep for the deleted symbol names
+  (`computeHandshakeSecrets`/`computeApplicationSecrets`/`.selectedCipherSuite`/`appendToFile(`/
+  `writeSecretsToFile`/`wiresharkSecretsFile`) after all edits: only the two constructor/deletion-site
+  explanatory comments this step added and one pre-existing explanatory comment in
+  `HandshakePacketTest.java` (prose, not code) — zero dangling references. Added to §11 as item 32.
+- **Dependency check (this ADVICE task's item 3): both retained, confirmed, not just left alone.**
+  `at.favre.lib.hkdf`: same 5 consumers as §6.1's original grep
+  (`ConnectionSecrets.java`/`BaseAeadImpl.java`/`ChaCha20.java`/`Aes128Gcm.java`/`Aes256Gcm.java`),
+  `core/build.gradle:78`/`module-info.java:3` unchanged. `io.whitfin.siphash`: still the sole consumer
+  `SecureHash.java`, `core/build.gradle:80`/`module-info.java:4` unchanged. Nothing else in
+  `build.gradle` became newly unused by this step's deletions (the removed imports were all
+  JDK-standard-library, not external dependencies) — `build.gradle` untouched, per this task's
+  instruction to leave it alone absent an explicit doc directive.
+- **Verification, all green, exact numbers**: `clean :kwik:test` → 997/994/0/3 (baseline match, zero
+  delta). `:kwik:keyLimitsRolloverTest` → 3/3 (`KeyLimitsRealRolloverRoundTripTest`, unchanged, unaffected
+  by this step). Whole-reactor `build` → `BUILD SUCCESSFUL`, all six subprojects. `git diff master --
+  InitialPacket.java ZeroRttPacket.java RetryPacket.java VersionNegotiationPacket.java` → empty for all
+  four (`0` lines each), confirmed explicitly, not merely assumed from Step B/C's prior confirmation.
+- **Files changed**: production only — `ConnectionSecrets.java`, `QuicClientConnectionImpl.java`,
+  `ServerConnectionImpl.java` (3 files, 44 insertions / 75 deletions). No test files needed edits (see
+  the stale-7-file-count finding above). No `build.gradle`/`module-info.java` changes.
+- **Residual uncertainty, stated plainly per this task's own brief rather than asserted away**: high
+  confidence the reduced `ConnectionSecrets` shape is behaviorally identical to before for the
+  Initial/0-RTT paths it retains (no logic inside the surviving methods was touched, only dead code
+  around them was removed) and that the four removed `handshakeSecretsKnown`/`handshakeFinished` calls
+  were genuinely write-only (verified by grepping every reader, not assumed). What was *not*, and could
+  not practically be, verified: whether the still-live legacy `TlsClientEngine`/`TlsServerEngine`-driven
+  handshake path (unaffected by this step, still not replaced by §3.3) has any other, more indirect
+  dependency on `computeHandshakeSecrets`/`computeApplicationSecrets` having been called — e.g. a timing
+  or ordering assumption elsewhere in `QuicClientConnectionImpl`/`ServerConnectionImpl` that happens not
+  to be exercised by the current 997-test suite. The full-repo symbol grep and the unchanged test count
+  are the same class of evidence Step C's own "residual uncertainty" paragraph relied on for
+  `KeyUpdateSupport`'s deletion, not a materially weaker check.
+
 This ordering keeps `KeyUpdateSupport`'s deletion — the single highest-consequence item per the
 WARN — in its own small, reviewable step (C) rather than buried inside the larger AEAD re-pointing
 (B), and keeps the genuinely novel architectural question (§5) resolved *before* any code is
@@ -1933,3 +2032,51 @@ full record):**
     (standing JEP-517-track interface-divergence cost, no benefit while the case cannot get past
     UNSUPPORTED). A companion test driving a real rollover via `jdk.quic.tls.keyLimits` is being
     added separately, not by this correction pass (§10 OQ-1 review-outcome block, item 4).
+
+**Corrections added while executing Step D (this revision, 2026-07-21; Step D is DONE, see §8's Step D
+entry for the full report — items below are corrections/additions this document's own text needed once
+Step D was actually executed, not just planned):**
+
+30. **§6.1.2's constructor row ("yes, unchanged") and the doc's blast-radius tables (§6.1.2's
+    "call-site confirmation," §7.1) both understated Step D's real fallout — two distinct gaps, neither
+    a hypothetical, both found only by attempting the deletion, not by re-reading the plan.**
+    (a) The constructor's *signature* is unchanged (all ~15 construction sites, production and test,
+    still compile and pass with zero edits), but its *body* is not: the file-creation block that
+    populated the now-deleted `writeSecretsToFile`/`wiresharkSecretsFile` fields had to be removed too,
+    leaving the `wiresharksecrets` `Path` parameter accepted but silently unused. Concretely, this means
+    `QuicClientConnection.Builder.secrets(Path)` and the CLI's `-secrets` flag — both still present,
+    still documented as writing a Wireshark secrets file — now silently no-op: no error, no warning, no
+    file. §6.1.2's own framing of the `appendToFile` deletion ("worth one line in release notes") did
+    not anticipate that the loss would surface as a still-live, silently-inert public option rather than
+    a removed one. Left as found (adding new warning/error/deprecation logic would be redesign, out of
+    Step D's remit) and flagged here for board/Peter attention. (b) `computeHandshakeSecrets`/
+    `computeApplicationSecrets` had two real production call-site pairs —
+    `QuicClientConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()` and
+    `ServerConnectionImpl.handshakeSecretsKnown()`/`.handshakeFinished()`, all four still driven by the
+    pre-§3.3 legacy `TlsClientEngine`/`TlsServerEngine` handshake path — that no section of this document
+    ever examined, because every blast-radius table audited call sites of the *surviving* `Connection
+    Secrets` methods, never call sites *of the methods being deleted*. Verified safe to remove outright
+    (not replace) by grepping every reader of `getClientAead`/`getServerAead`/`getPeerAead`/`getOwnAead`
+    and confirming the `Handshake`/`App` Aeads these two methods wrote have had no reader anywhere since
+    Step B re-pointed those two levels to `QuicTlsPort` — the calls were write-only dead code, not live
+    behavior, but this document did not previously establish that (§8, Step D's "DONE" box).
+31. **§8's Step D planning paragraph's "Rewrite the 7-file test fixture migration (§7.2) — unchanged in
+    count and shape by this correction" is confirmed stale, not merely restated.** It was accurate when
+    §6.1.1/§6.1.2 first finalized the Initial+0-RTT shape, but Step B's own later execution (already
+    recorded in this same document, in Step B's "DONE" box, above Step D's own entry) had already
+    migrated 5 of the 7 files (`HandshakePacketTest.java`, `ShortHeaderPacketTest.java`,
+    `SenderImplTest.java`, `PacketAssemblerTest.java`, `AbstractSenderTest.java`) as a forced side effect
+    of its production rewrite, by the time Step D began — a fact Step D's own still-unrevised planning
+    text (written before Step B ran) did not reflect. The remaining 2 (`InitialPacketTest.java`,
+    `ZeroRttPacketTest.java`) needed **zero changes**, not a migration: both consume
+    `TestUtils.createKeys()`/`CryptoTestUtils.createKeys()`, which mocks a real, unmodified `Aes128Gcm`
+    directly and has no dependency on anything Step D deletes. Net effect: Step D's actual test-file
+    diff is empty, not "7 files, same count and shape" (§8, Step D's "DONE" box).
+32. **Confirmed, not merely restated: §6.1.2's field/method table for `ConnectionSecrets.java` was
+    exhaustive and exactly right — deleting exactly its delete-list and keeping exactly its survivor-list
+    compiles clean, keeps the full suite at the unchanged 997/994/0/3 baseline, and leaves zero dangling
+    references to any deleted symbol anywhere in the six-subproject reactor** (repo-wide grep after all
+    edits, matching the same discipline Step C's item 26 applied to `Aead.java`). The two gaps this
+    revision records (items 30-31) are both blast-radius/staleness gaps in the document's own supporting
+    text, not gaps in §6.1.2's `ConnectionSecrets`-internal survivor/delete list itself, which needed no
+    correction (§8, Step D's "DONE" box).
