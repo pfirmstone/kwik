@@ -18,6 +18,9 @@
  */
 package tech.kwik.core.packet;
 
+import jdk.internal.net.quic.QuicKeyUnavailableException;
+import jdk.internal.net.quic.QuicTLSEngine;
+import jdk.internal.net.quic.QuicTransportException;
 import tech.kwik.core.QuicConstants;
 import tech.kwik.core.common.EncryptionLevel;
 import tech.kwik.core.common.PnSpace;
@@ -27,11 +30,15 @@ import tech.kwik.core.generic.IntegerTooLargeException;
 import tech.kwik.core.generic.InvalidIntegerEncodingException;
 import tech.kwik.core.impl.*;
 import tech.kwik.core.log.Logger;
+import tech.kwik.core.tls.QuicTlsPort;
 
+import javax.crypto.AEADBadTagException;
+import javax.crypto.ShortBufferException;
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.IntFunction;
 
 import static tech.kwik.core.common.KwikConstants.MAX_SUPPORTED_PACKET_SIZE;
 
@@ -214,6 +221,224 @@ abstract public class QuicPacket {
         //  PROTOCOL_VIOLATION. Discarding such a packet after only removing header protection can expose the endpoint
         //  to attacks (...)."
         checkReservedBits(decryptedFlags);
+    }
+
+    // ---- Port-based packet protection (Handshake/App only) -----------------------------------
+    // ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §2.3/§3/§8 Step B. Only HandshakePacket and
+    // ShortHeaderPacket override generatePacketBytes(QuicTlsPort)/parse(..., QuicTlsPort, ...) --
+    // InitialPacket, ZeroRttPacket, RetryPacket and VersionNegotiationPacket stay permanently on the
+    // Aead-taking methods above (§6.1.1/§6.1.2/§10 OQ-4) and never override these; calling them on
+    // one of those four is a caller bug, hence the unchecked exception below rather than a silent
+    // no-op.
+
+    /**
+     * Port-based counterpart of {@link #generatePacketBytes(Aead)}. See the class-hierarchy note
+     * above.
+     *
+     * <p>{@code QuicTransportException} (e.g. AEAD confidentiality limit exceeded, per
+     * {@code QuicTLSEngine.encryptPacket}'s javadoc) is deliberately NOT translated to
+     * {@link TransportError} here the way the receive-path does below -- there is no packet to
+     * "drop" on the send path the way there is on receive, and this document's OQ-5 flags proper
+     * connection-close-on-limit-exceeded handling as unresolved, Step-C-adjacent work. Callers
+     * (currently just {@code SenderImpl}) must handle it explicitly rather than have it silently
+     * absorbed here.
+     */
+    public byte[] generatePacketBytes(QuicTlsPort tlsPort) throws QuicKeyUnavailableException, QuicTransportException {
+        throw new UnsupportedOperationException(getClass().getSimpleName()
+                + " does not use the port-based protection path (see QuicPacket's port-based-protection note)");
+    }
+
+    /**
+     * Port-based counterpart of {@link #parse(ByteBuffer, Aead, long, Logger, int)}. See the
+     * class-hierarchy note above.
+     */
+    public void parse(ByteBuffer data, QuicTlsPort tlsPort, long largestPacketNumber, Logger log, int sourceConnectionIdLength)
+            throws DecryptionException, InvalidPacketException, TransportError, QuicKeyUnavailableException {
+        throw new UnsupportedOperationException(getClass().getSimpleName()
+                + " does not use the port-based protection path (see QuicPacket's port-based-protection note)");
+    }
+
+    /**
+     * Port-based counterpart of {@link #parsePacketNumberAndPayload(ByteBuffer, int, byte, int, Aead, long, Logger)}.
+     * Only called by {@link HandshakePacket}/{@link ShortHeaderPacket}'s port-based {@code parse}.
+     * Receive-path ordering per ADVICE doc §3: sample -&gt; unmask header (port) -&gt; decode packet
+     * number (unchanged, shared) -&gt; decrypt (port). Nonce construction and key-phase ratchet
+     * bookkeeping (kwik's own {@code Aead.checkKeyPhase}/{@code confirmKeyUpdateIfInProgress}) are
+     * gone: the engine owns both internally now (§2.3).
+     *
+     * <p>{@code QuicKeyUnavailableException} is left to propagate (mirrors {@link MissingKeysException}
+     * for the legacy {@code Aead} path -- both mean "drop this packet, keys aren't ready", see
+     * {@code PacketParser.parseAndProcessPackets}'s catch clause). {@code QuicTransportException} is
+     * translated to {@link TransportError} instead of propagated as a new checked type, to avoid
+     * widening {@code PacketParser}/callers' exception surface for what is, on the receive path,
+     * already-existing "connection error" territory {@code TransportError} covers.
+     */
+    void parsePacketNumberAndPayload(ByteBuffer buffer, int packetStartPosition, byte flags, int remainingLength,
+                                      QuicTlsPort tlsPort, QuicTLSEngine.KeySpace keySpace,
+                                      long largestPacketNumber, Logger log)
+            throws DecryptionException, InvalidPacketException, TransportError, QuicKeyUnavailableException {
+        if (buffer.remaining() < remainingLength) {
+            throw new InvalidPacketException();
+        }
+
+        int packetNumberStartPosition = buffer.position();
+        if (buffer.remaining() < 4) {
+            throw new InvalidPacketException();
+        }
+        buffer.position(packetNumberStartPosition + 4);
+        int sampleSize = tlsPort.getHeaderProtectionSampleSize(keySpace);
+        if (buffer.remaining() < sampleSize) {
+            throw new InvalidPacketException();
+        }
+        byte[] sample = new byte[sampleSize];
+        buffer.get(sample);
+        buffer.position(packetNumberStartPosition);
+
+        byte[] mask;
+        try {
+            mask = portComputeHeaderProtectionMask(tlsPort, keySpace, true, sample);
+        }
+        catch (QuicTransportException e) {
+            throw new TransportError(QuicConstants.TransportErrorCode.INTERNAL_ERROR,
+                    "QUIC-TLS engine error computing header protection mask: " + e.getMessage());
+        }
+
+        byte decryptedFlags;
+        if ((flags & 0x80) == 0x80) {
+            // Long header: 4 bits masked
+            decryptedFlags = (byte) (flags ^ mask[0] & 0x0f);
+        }
+        else {
+            // Short header: 5 bits masked
+            decryptedFlags = (byte) (flags ^ mask[0] & 0x1f);
+        }
+        setUnprotectedHeader(decryptedFlags);
+
+        int protectedPackageNumberLength = (decryptedFlags & 0x03) + 1;
+        byte[] protectedPackageNumber = new byte[protectedPackageNumberLength];
+        buffer.get(protectedPackageNumber);
+
+        byte[] unprotectedPacketNumber = new byte[protectedPackageNumberLength];
+        for (int i = 0; i < protectedPackageNumberLength; i++) {
+            unprotectedPacketNumber[i] = (byte) (protectedPackageNumber[i] ^ mask[1 + i]);
+        }
+        long truncatedPacketNumber = bytesToInt(unprotectedPacketNumber);
+        packetNumber = decodePacketNumber(truncatedPacketNumber, largestPacketNumber, protectedPackageNumberLength * 8);
+        log.decrypted("Unprotected packet number: " + packetNumber);
+
+        int payloadStartPosition = buffer.position();
+        byte[] frameHeader = new byte[payloadStartPosition - packetStartPosition];
+        buffer.position(packetStartPosition);
+        buffer.get(frameHeader);
+        frameHeader[0] = decryptedFlags;
+        buffer.position(payloadStartPosition);
+        System.arraycopy(unprotectedPacketNumber, 0, frameHeader, frameHeader.length - protectedPackageNumberLength, protectedPackageNumberLength);
+        log.encrypted("Frame header", frameHeader);
+
+        int encryptedPayloadLength = remainingLength - protectedPackageNumberLength;
+        if (encryptedPayloadLength < 1) {
+            throw new InvalidPacketException();
+        }
+        byte[] payload = new byte[encryptedPayloadLength];
+        buffer.get(payload, 0, encryptedPayloadLength);
+        log.encrypted("Encrypted payload", payload);
+
+        // https://www.rfc-editor.org/rfc/rfc9001.html#section-5.3 -- AAD is the header up to and
+        // including the unprotected packet number; QuicTlsPort#decryptPacket takes header+ciphertext
+        // in one buffer with headerLength marking that boundary, rather than a separately-passed AAD
+        // array the way Aead#aeadDecrypt did.
+        byte[] packetWithHeader = new byte[frameHeader.length + payload.length];
+        System.arraycopy(frameHeader, 0, packetWithHeader, 0, frameHeader.length);
+        System.arraycopy(payload, 0, packetWithHeader, frameHeader.length, payload.length);
+
+        // Key phase only applies to ShortHeaderPacket (App/ONE_RTT); -1 means "not applicable" per
+        // QuicTLSEngine.decryptPacket's own javadoc. Mirrors the pre-rewrite
+        // "if (this instanceof ShortHeaderPacket) { aead.checkKeyPhase(...) }" pattern this replaces.
+        int keyPhase = (this instanceof ShortHeaderPacket) ? ((ShortHeaderPacket) this).keyPhaseBit : -1;
+
+        byte[] frameBytes;
+        try {
+            frameBytes = portDecryptPacket(tlsPort, keySpace, packetNumber, keyPhase, packetWithHeader, frameHeader.length);
+        }
+        catch (AEADBadTagException tagMismatch) {
+            throw new DecryptionException();
+        }
+        catch (QuicTransportException e) {
+            // e.g. AEAD integrity limit exceeded (QuicTLSEngine.decryptPacket's javadoc) -- a real
+            // connection error, not a plain decrypt failure; surfaced as TransportError rather than a
+            // dropped packet. Precise AEAD_LIMIT_REACHED classification is left as OQ-5/Step-C
+            // follow-up work (ADVICE doc §9/§10 OQ-5) rather than guessed at here from the message.
+            throw new TransportError(QuicConstants.TransportErrorCode.INTERNAL_ERROR,
+                    "QUIC-TLS engine error decrypting packet: " + e.getMessage());
+        }
+        log.decrypted("Decrypted payload", frameBytes);
+
+        frames = new ArrayList<>();
+        parseFrames(frameBytes, log);
+        checkReservedBits(decryptedFlags);
+    }
+
+    /**
+     * Thin wrapper draining {@link QuicTlsPort#computeHeaderProtectionMask} into a byte array, for
+     * the XOR logic in the port-based receive/send helpers above/below. Mirrors the {@code Aead}-based
+     * {@link #createHeaderProtectionMask(byte[], Aead)} sibling.
+     */
+    static byte[] portComputeHeaderProtectionMask(QuicTlsPort tlsPort, QuicTLSEngine.KeySpace keySpace, boolean incoming, byte[] sample)
+            throws QuicKeyUnavailableException, QuicTransportException {
+        ByteBuffer mask = tlsPort.computeHeaderProtectionMask(keySpace, incoming, ByteBuffer.wrap(sample));
+        byte[] maskBytes = new byte[mask.remaining()];
+        mask.get(maskBytes);
+        return maskBytes;
+    }
+
+    /**
+     * Encrypts {@code payload} via {@link QuicTlsPort#encryptPacket}, returning ciphertext+tag.
+     * {@code headerGenerator} is invoked by the engine with the key phase it has decided on --
+     * ADVICE doc §2.3/§3: for {@code ShortHeaderPacket} this may only be known inside this call,
+     * because the engine may roll keys over as a side effect of it; for {@code HandshakePacket}
+     * there is no key phase and the callback ignores its argument.
+     */
+    static byte[] portEncryptPacket(QuicTlsPort tlsPort, QuicTLSEngine.KeySpace keySpace, long packetNumber,
+                                     IntFunction<ByteBuffer> headerGenerator, byte[] payload)
+            throws QuicKeyUnavailableException, QuicTransportException {
+        ByteBuffer output = ByteBuffer.allocate(payload.length + tlsPort.getAuthTagSize());
+        try {
+            tlsPort.encryptPacket(keySpace, packetNumber, headerGenerator, ByteBuffer.wrap(payload), output);
+        }
+        catch (ShortBufferException e) {
+            // Kwik sizes the output buffer itself (payload + auth tag size, above); a
+            // ShortBufferException here indicates a kwik-side sizing bug, not an operational/protocol
+            // condition -- see ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §8 Step B verification
+            // notes.
+            throw new IllegalStateException("output buffer too small for encryptPacket", e);
+        }
+        output.flip();
+        byte[] ciphertext = new byte[output.remaining()];
+        output.get(ciphertext);
+        return ciphertext;
+    }
+
+    /**
+     * Decrypts a packet via {@link QuicTlsPort#decryptPacket}. {@code packetWithHeader} must contain
+     * the header (with header protection already removed) followed immediately by the
+     * still-encrypted payload+tag; {@code headerLength} is the boundary between the two (used by the
+     * engine as the AAD length). {@code keyPhase} is the bit parsed off the wire for
+     * {@code ShortHeaderPacket}, or {@code -1} for key spaces where it does not apply.
+     */
+    static byte[] portDecryptPacket(QuicTlsPort tlsPort, QuicTLSEngine.KeySpace keySpace, long packetNumber, int keyPhase,
+                                     byte[] packetWithHeader, int headerLength)
+            throws QuicKeyUnavailableException, AEADBadTagException, QuicTransportException {
+        ByteBuffer output = ByteBuffer.allocate(packetWithHeader.length - headerLength);
+        try {
+            tlsPort.decryptPacket(keySpace, packetNumber, keyPhase, ByteBuffer.wrap(packetWithHeader), headerLength, output);
+        }
+        catch (ShortBufferException e) {
+            throw new IllegalStateException("output buffer too small for decryptPacket", e);
+        }
+        output.flip();
+        byte[] plaintext = new byte[output.remaining()];
+        output.get(plaintext);
+        return plaintext;
     }
 
     protected void setUnprotectedHeader(byte decryptedFlags) {}

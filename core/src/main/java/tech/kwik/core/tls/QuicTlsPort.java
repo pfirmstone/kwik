@@ -24,6 +24,7 @@ import jdk.internal.net.quic.QuicTLSEngine;
 import jdk.internal.net.quic.QuicTransportException;
 import jdk.internal.net.quic.QuicTransportParametersConsumer;
 import jdk.internal.net.quic.QuicVersion;
+import tech.kwik.core.common.EncryptionLevel;
 
 import javax.crypto.AEADBadTagException;
 import javax.crypto.ShortBufferException;
@@ -253,4 +254,43 @@ public interface QuicTlsPort {
      */
     void verifyRetryPacket(QuicVersion version, ByteBuffer originalConnectionId, ByteBuffer packet)
             throws AEADBadTagException, QuicTransportException;
+
+    // ---- EncryptionLevel <-> KeySpace mapping (§4.1, Step B) ----------------------------------
+
+    /**
+     * Translates a kwik {@link EncryptionLevel} to the port's {@link QuicTLSEngine.KeySpace}, for use
+     * at the {@code PacketParser}/{@code SenderImpl} call sites that select which key space to pass
+     * into the packet-protection methods above (ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §3/§4).
+     *
+     * <p>{@link EncryptionLevel#ZeroRTT} has no mapping: per SOW §3.5 (STD-010 §6.2), 0-RTT re-pointing
+     * to this port is a separate, not-yet-scoped work item, and per §6.1.1 of the ADVICE doc above,
+     * {@code ZeroRttPacket} continues to use the legacy {@code ConnectionSecrets}/{@code Aead}
+     * path for the duration of this rewrite, never this port. Callers MUST branch on
+     * {@code EncryptionLevel == ZeroRTT} themselves and never reach this method for it; calling it
+     * with {@code ZeroRTT} is a caller bug, hence an unchecked exception, not a checked one.
+     *
+     * <p>{@link EncryptionLevel#Initial} likewise stays permanently on the legacy path per §6.1.2/§10
+     * (OQ-4) of the ADVICE doc -- this method still translates it correctly (the mapping itself is
+     * 1:1), but no re-pointed call site is expected to actually invoke this method with {@code Initial}.
+     *
+     * <p>{@link QuicTLSEngine.KeySpace#RETRY} has no corresponding {@code EncryptionLevel} at all
+     * (RFC 9001 §5.8's Retry integrity tag is not TLS-secret-derived) and is therefore not a case this
+     * method can be asked to produce -- there is no {@code EncryptionLevel} value that maps to it.
+     * {@code RetryPacket} uses {@link #signRetryPacket}/{@link #verifyRetryPacket} directly instead.
+     *
+     * @throws IllegalArgumentException if {@code level} is {@link EncryptionLevel#ZeroRTT}
+     */
+    static QuicTLSEngine.KeySpace toKeySpace(EncryptionLevel level) {
+        switch (level) {
+            case Initial:   return QuicTLSEngine.KeySpace.INITIAL;
+            case Handshake: return QuicTLSEngine.KeySpace.HANDSHAKE;
+            case App:       return QuicTLSEngine.KeySpace.ONE_RTT;
+            case ZeroRTT:
+                throw new IllegalArgumentException(
+                        "ZeroRTT has no KeySpace mapping: 0-RTT is not re-pointed to the port by this " +
+                        "rewrite (SOW §3.5); ZeroRttPacket must use the legacy Aead path, not this method.");
+            default:
+                throw new IllegalStateException("unreachable: " + level); // exhaustive switch guard
+        }
+    }
 }
