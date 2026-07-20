@@ -211,8 +211,12 @@ class HandshakeShortHeaderPacketRealEngineRoundTripTest {
     }
 
     // ---- handshake pump helpers -----------------------------------------------------------------
+    // Package-private (not private): reused as-is by KeyUpdateRatchetRemovalRealEngineRoundTripTest
+    // (Step C's own new test, ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md §7.2/§8 Step C), rather
+    // than duplicated, per this task's brief to "reuse [this class's] construction pattern". No
+    // logic change, visibility only.
 
-    private static void pump(QuicTlsPort port, QuicTlsPort peer) throws Exception {
+    static void pump(QuicTlsPort port, QuicTlsPort peer) throws Exception {
         for (int i = 0; i < 20; i++) {
             HandshakeState state = port.getHandshakeState();
             if (state == HandshakeState.NEED_TASK) {
@@ -252,7 +256,7 @@ class HandshakeShortHeaderPacketRealEngineRoundTripTest {
         }
     }
 
-    private static TrustManager[] trustAllClientSide() {
+    static TrustManager[] trustAllClientSide() {
         // Test-only: this harness exists to derive real key material for a crypto round-trip test,
         // not to verify certificate validation policy -- a permissive trust manager keeps the pump
         // loop free of delegated cert-path-validation tasks unrelated to what this test class checks.
@@ -268,7 +272,7 @@ class HandshakeShortHeaderPacketRealEngineRoundTripTest {
     }
 
     /** Mirrors QuicTlsPortImplRealEngineTest's construction sequence (per SOW §3.3 note). */
-    private static void configureMinimal(QuicTlsPort port) throws Exception {
+    static void configureMinimal(QuicTlsPort port) throws Exception {
         SSLParameters p = port.getSSLParameters();
         p.setApplicationProtocols(new String[]{ "kwik-port-test" });
         p.setProtocols(new String[]{ "TLSv1.3" });
