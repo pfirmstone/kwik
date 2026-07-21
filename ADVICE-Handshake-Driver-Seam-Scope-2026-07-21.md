@@ -60,8 +60,8 @@ DirtyChai image, per the `--release`-cannot-see-`jdk.internal.net.quic` constrai
 **Board review outcome (2026-07-21, three seats: fact-check/security-RFC/architecture):**
 unanimous **APPROVE WITH CHANGES**. Nine blocking (MUST-FIX) corrections, all board-verified,
 folded into the sections below; OQ-B1–OQ-B6 (board-level questions) are now ANSWERED; OQ-P1–OQ-P6
-(Peter-level questions) carry board recommendations but are recorded as **PENDING** — this review
-does not resolve them. Full numbered correction log: §11.
+(Peter-level questions) carried board recommendations, all **ACCEPTED by Peter in full (2026-07-21)** —
+see §9. Full numbered correction log: §11.
 
 ---
 
@@ -476,7 +476,7 @@ fuzz targets.
   for Version Negotiation, `QuicTLSEngine.java:210-218`). Byte-caching is the correct mechanism;
   note it also removes the `originalClientHello` field (`:159`).
 - **Version Negotiation packets / `restartHandshake()`**: unchanged scope — Inc 4, not §3.3's
-  first landing. **Compatible VN**: recommend removal (OQ-P4, §0 item 3; PENDING Peter — board
+  first landing. **Compatible VN**: removal (OQ-P4, §0 item 3; ACCEPTED by Peter 2026-07-21 — board
   recommendation detailed in §9's OQ-P4 entry and §11 item 6, including disposal of the
   `version_information` transport parameter, which the SOW-derived scope above did not address).
 
@@ -518,7 +518,7 @@ fuzz targets.
   `h09/Http09Client.java`, `QuicClientConnection.connect(List<StreamEarlyData>)`/`StreamEarlyData`)
   — these break when the above dies even though they carry no `agent15` import themselves, and
   were not in the original §3.1 accounting;
-- **Board addition, compatible-VN (§11 item 6, OQ-P4 board recommendation, PENDING Peter):** if
+- **Board addition, compatible-VN (§11 item 6, OQ-P4 board recommendation, ACCEPTED by Peter 2026-07-21):** if
   OQ-P4 resolves as recommended, the `version_information` transport parameter dies both
   directions (server send `ServerConnectionImpl.java:393`; validation
   `ServerConnectionImpl.java:630-643` and `QuicClientConnectionImpl.java:1017-1032`), and so does
@@ -875,7 +875,7 @@ fault").
 
 **Decision-gate sequencing (board correction 8, §11 item 8):** OQ-P1 must be pinned **before
 Stage A starts**; OQ-P3 and OQ-P4 **before Stage B**; OQ-P5 and OQ-P6 **before Stage C**. All
-six remain PENDING Peter (§9).
+six ACCEPTED by Peter 2026-07-21 (§9).
 
 ### Blast radius (production)
 
@@ -907,9 +907,13 @@ Explicitly untouched: the nine kept transport packages (`ack`,`cc`,`cid`,`frame`
 
 ### Peter must decide
 
-All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recommendation to each
-(recorded below, §11 item 16) but this review does **not** resolve them. Sequencing (§11 item
-8): OQ-P1 before Stage A starts; OQ-P3/OQ-P4 before Stage B; OQ-P5/OQ-P6 before Stage C.
+All six are **RESOLVED — Peter accepted every board recommendation in full (2026-07-21).** The
+board recommendation attached to each (recorded below, §11 item 16) is now Peter's ruling; the
+per-OQ entries below are marked ACCEPTED. Sequencing (§11 item 8): OQ-P1 before Stage A starts;
+OQ-P3/OQ-P4 before Stage B; OQ-P5/OQ-P6 before Stage C. (OQ-P2 mechanism — session-cache size 0
+vs `jdk.tls.server.newSessionTicketCount=0` vs driver-declines-NST — remains the implementer's
+choice at Stage build time; the accepted requirement is resumption "disabled" as a positive
+assertion.)
 
 - **OQ-P1 (API surface).** Public builder API: replace agent15-typed knobs
   (`cipherSuite(TlsConstants.CipherSuite)`, `sessionTicket(...)`, cert/key-manager trio) with (i)
@@ -917,7 +921,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
   wrappers (recommended — matches JGDMS use and the fork's DirtyChai-only posture), or (ii)
   parallel kwik-local enums preserving source shape for upstream-tracking? Note §3.6 is hostage
   to this (§3.2).
-  **Board rec (PENDING Peter, gates Stage A):** option (i) — `sslContext(SSLContext)` + optional
+  **Board rec — ACCEPTED by Peter 2026-07-21 (gates Stage A):** option (i) — `sslContext(SSLContext)` + optional
   `SSLParameters`, keeping `withCertificate`/`withKeyStore`/`noServerCertificateCheck` as thin
   wrappers. The enum option still conflicts on every upstream merge anyway and adds a permanent
   mapping to maintain.
@@ -926,7 +930,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
   binding (`setSessionData`, `ServerConnectionImpl:403-404`) is lost with it — or disable
   resumption outright for the first cut (SOW §3.5 already leans "leave out")? Recommend: delete
   API, leave JSSE cache at defaults, revisit if JGDMS wants resumption.
-  **Board rec (PENDING Peter) — STRENGTHENED beyond this document's original recommendation, on
+  **Board rec — ACCEPTED by Peter 2026-07-21 — STRENGTHENED beyond this document's original recommendation, on
   a real finding:** delete the ticket API **and positively disable TLS resumption** for the
   first cut — do not leave the JSSE cache at defaults. JSSE's TLS 1.3 PSK resumption carries the
   original client identity forward **without re-running the trust manager**
@@ -938,7 +942,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
 - **OQ-P3 (per-ALPN transport params).** Accept §2.3 option (a)'s capability regression
   (advertised params per-server, enforced limits still per-protocol)? Recommended yes; option
   (b)'s CH pre-scan is the fallback if not.
-  **Board rec (PENDING Peter, gates Stage B):** accept — the regression is operational only —
+  **Board rec — ACCEPTED by Peter 2026-07-21 (gates Stage B):** accept — the regression is operational only —
   **with** the clamp stated as a named Stage B work item: enforced limits must be ≥ advertised
   (the post-consume merge may never lower a limit below its EncryptedExtensions-advertised
   value).
@@ -947,7 +951,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
   of the client's Initial, client's `preferredVersion` knob dies; full VN via `restartHandshake`
   stays Inc 4? (Engine one-shot `versionNegotiated` + EE-fixed-at-consume make the current
   mechanism unimplementable without engine changes, which are advise-only DirtyChai territory.)
-  **Board rec (PENDING Peter, gates Stage B):** drop compatible-VN **and drop the
+  **Board rec — ACCEPTED by Peter 2026-07-21 (gates Stage B):** drop compatible-VN **and drop the
   `version_information` transport parameter in both directions** (board correction 6, §11 item
   6): keeping the TP advertised (`ServerConnectionImpl.java:393` sends [v1,v2]) while deleting
   the validation (`ServerConnectionImpl.java:630-643`,
@@ -960,7 +964,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
 - **OQ-P5 (client-auth default).** New server `needClientAuth` knob: default true (fork's
   raison d'être, fails closed for JGDMS) or false (upstream-compatible, JGDMS sets it)? Recommend
   true-by-default with an explicit opt-out, documented as a deliberate divergence.
-  **Board rec (PENDING Peter, gates Stage C):** default **true**, and it has teeth:
+  **Board rec — ACCEPTED by Peter 2026-07-21 (gates Stage C):** default **true**, and it has teeth:
   `CLIENT_AUTH_REQUIRED` is the *only* JSSE setting where a cert-less client fails closed
   (`CertificateMessage.java:1127-1139`); with "want", an empty chain silently continues
   unauthenticated — precisely the mission failure. Riders: a caller-supplied `SSLParameters`
@@ -970,7 +974,7 @@ All six remain **OPEN — PENDING Peter**. The 2026-07-21 board attached a recom
 - **OQ-P6 (deadline default).** Handshake-completion deadline default value (suggest 30 s,
   mirroring JGDMS P1/F2's posture) and whether it should also bound the candidate stage's 30 s
   cleanup constant (`ServerConnectionCandidate:137`) under one config item.
-  **Board rec (PENDING Peter, gates Stage C):** 30 s default, **plus a
+  **Board rec — ACCEPTED by Peter 2026-07-21 (gates Stage C):** 30 s default, **plus a
   concurrent-handshaking-connections cap alongside it** — the deadline bounds half-open
   *lifetime*, not *concurrency*, and kwik has no connection cap today.
 
@@ -1050,8 +1054,8 @@ delivered verbatim both directions.
 
 Verdict: unanimous **APPROVE WITH CHANGES**. For traceability, every change the review made to
 this document, numbered as cited throughout. Items 1–9 are the blocking (MUST-FIX) corrections,
-all board-verified; 10–15 are the OQ-B answers; 16 records the OQ-P recommendations (decisions
-**PENDING Peter**); 17–25 are advisory corrections and nits.
+all board-verified; 10–15 are the OQ-B answers; 16 records the OQ-P recommendations (all
+**ACCEPTED by Peter 2026-07-21**); 17–25 are advisory corrections and nits.
 
 **Blocking (MUST-FIX):**
 
@@ -1138,7 +1142,7 @@ all board-verified; 10–15 are the OQ-B answers; 16 records the OQ-P recommenda
     surfaces recorded as §7.3a fuzz targets. (§2.3, §9.)
 15. OQ-B6 ANSWERED — drive-loop cap ~64, empty-but-non-null terminal, cap breach →
     `INTERNAL_ERROR`, fail-closed. (§2.2, §9.)
-16. OQ-P1–OQ-P6 recorded with board recommendations, all **PENDING Peter** — including the
+16. OQ-P1–OQ-P6 recorded with board recommendations, all **ACCEPTED by Peter 2026-07-21** — including the
     STRENGTHENED OQ-P2 (positively disable TLS resumption: JSSE PSK resumption re-admits the
     original identity without re-running the trust manager,
     `PreSharedKeyExtension.canRejoin:446-459`), OQ-P5's fail-closed `CLIENT_AUTH_REQUIRED`
