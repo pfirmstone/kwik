@@ -1,8 +1,13 @@
 # SOW — Kwik fork: drive the QUIC transport with the JDK's JSSE QUIC-TLS engine
 
-- **Date:** 2026-07-06
+- **Date:** 2026-07-06 (last updated 2026-07-24)
 - **Repo:** `github.com/pfirmstone/kwik` (fork of `github.com/ptrd/kwik`; `upstream` remote tracked)
-- **Status:** Scope of work / planning. Describes the work to be done; no implementation here.
+- **Status:** Scope of work / planning, **partially implemented**. §3.1 (isolation port) and §3.2
+  (crypto seam) are DONE on `master` (commit evidence in each section). §3.3 (handshake-driver
+  seam) is fully SCOPED and board-ratified — see `ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md`
+  (the authoritative detailed scope: unanimous board APPROVE WITH CHANGES, all six Peter-level open
+  questions decided, Stage A ready to start) — but not yet implemented. §3.4–§3.6 remain scoped,
+  not implemented.
 - **Runtime target:** DirtyChai (OpenJDK 27 fork) **only** — same posture as JGDMS. Not portable to
   stock OpenJDK (see §6).
 - **License:** LGPL-3.0 / GPL-3.0 (inherited from kwik). Retain upstream copyright, `LICENSE.txt`,
@@ -44,11 +49,11 @@ crypto, connection orchestration, transport-params, and session-tickets; the tra
 (`ack`, `cc`, `cid`, `frame`, `packet`, `recovery`, `send`, `receive`, `stream`) does **not** import
 agent15 directly.
 
-**Caveat — `packet` is not untouched.** `packet` does not *import* agent15, but it *consumes* the
-`Aead` objects that `ConnectionSecrets` (being deleted, §3.2) produces: `QuicPacket` calls
-`aeadEncrypt` / `createHeaderProtectionMask` etc. against those objects. `packet` is therefore part
-of the crypto-seam change surface, not untouched transport — see §3.2 for the re-architecture this
-implies.
+**Caveat — `packet` is not untouched.** `packet` does not *import* agent15, but it *consumed* the
+`Aead` objects that `ConnectionSecrets` produced. `packet` was therefore part of the crypto-seam
+change surface, not untouched transport — see §3.2, **DONE**: `QuicPacket`'s Handshake/App-level
+protect/unprotect now route through `QuicTlsPort` instead; `ConnectionSecrets` was reduced (not
+deleted) to the Initial+0-RTT shape it still owns.
 
 ---
 
@@ -113,7 +118,38 @@ a DirtyChai build — since `jdk.internal.net.quic` only exists on DirtyChai, ac
 CI cannot build this reactor at all as currently configured, independent of this fix. Not addressed
 here (no DirtyChai JDK artifact/publishing story exists yet) — flagged, not solved.
 
-### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's split calls
+### 3.2 Crypto seam — RE-ARCHITECT the packet AEAD call sites onto the engine's split calls — **DONE**
+
+**Status: DONE on `master`, landed as Steps A–D (2026-07-19 → 2026-07-21), evidence below.** The
+description that follows is kept in its original (pre-implementation) prescriptive form for
+scope/rationale traceability; the **Change** bullet and dependency-cleanup bullet below have been
+updated to record what actually landed vs. what was originally speculated.
+
+**Commit evidence:**
+- **Step A (design/scope):** `6a0ec320` (scope the rewrite), `91d9290c`/`8af5880b` (resolve OQ-4,
+  fold in board corrections, finalize the design spec) — full detail in
+  `ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md` (IMPLEMENTED).
+- **Step B (`QuicTlsPort`/`KeySpace` mapping + Handshake/App protect-unprotect rewrite):**
+  `d0cd1f2a` (1/3), `b861b823` (2/3, re-point `PacketParser`/`SenderImpl` call sites),
+  `5655c745` (3/3, test fixtures), `6381ea39` (verify: **real two-engine HANDSHAKE+ONE_RTT
+  round-trip test**), marked DONE at `fc5405e9`.
+- **Step C (key-update ratchet deletion):** `d121bfda` (1/2, delete `KeyUpdateSupport` + `Aead`
+  ratchet methods + `updateKeys()`), `6a51a5c7` (2/2, new targeted key-update test), marked DONE
+  at `1a46a4a0`; `e8e52986` subsequently added a test driving a **real engine-initiated ONE_RTT
+  key-update rollover** via `jdk.quic.tls.keyLimits`.
+- **Step D (`ConnectionSecrets` reduction):** `536666c3` (reduce `ConnectionSecrets` to the
+  Initial+0-RTT shape — deletes `computeHandshakeSecrets`/`computeApplicationSecrets`, the dead
+  `selectedCipherSuite` field, and the Wireshark-secrets-export machinery), marked DONE at
+  `b8a7715f`; `638f4238` subsequently removed the now-dead `Builder.secrets(Path)`/CLI `-secrets`
+  API surface that Step D had left as a silent no-op.
+
+**Caveat — this does not by itself complete Inc 1.** The rewired call sites and the deletions are
+verified by dedicated two-engine round-trip tests (Step B/C), not by a live production handshake:
+nothing in production yet *constructs* a `QuicTlsPortImpl` (the `tlsPort` fields on
+`QuicConnectionImpl`/`SenderImpl`/`PacketParser` are threaded but stay permanently `null` until
+§3.3 lands — see `ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md` §8's baseline). So the crypto
+seam is DONE, but "handshake completes client↔server over loopback" (Inc 1) is not, and is not
+claimed here — see §3.3 and §5.
 
 **This is a re-architecture of `packet` + both packet parsers, not a deletion.** kwik and the
 engine protect packets under **different shapes**: kwik's `QuicPacket` performs protection in
@@ -131,29 +167,75 @@ and both packet parsers — the call sites change shape, not just their source o
 
 - **Files:** `core/.../crypto/ConnectionSecrets.java`, `core/.../crypto/CryptoStream.java`,
   `core/.../packet/QuicPacket.java` (+ both packet parsers — see §2 caveat).
-- **Today:** kwik pulls raw traffic secrets from agent15 (`getClientHandshakeTrafficSecret()` …),
-  derives its own AEAD keys via HKDF, and builds its own `Aes128Gcm` / `Aes256Gcm` /
-  `ChaCha20Poly1305` ciphers, then calls its own two-step protect/unprotect from `QuicPacket`.
-- **Change:** delete the key-derivation and AEAD construction in `ConnectionSecrets`; re-point
-  `QuicPacket`'s two-step call sites onto the engine's split calls via the port: `encryptPacket` /
-  `decryptPacket` / `computeHeaderProtectionMask` / `getHeaderProtectionSampleSize` /
-  `getAuthTagSize` / `deriveInitialKeys` / `keysAvailable` / `discardKeys`. **Raw secrets are never
-  requested** — this is the security point of the fork.
-- **KEY-UPDATE — explicit deletion, not adaptation.** The 1-RTT key-phase ratchet lives
-  transport-side today: `KeyUpdateSupport` plus `ShortHeaderPacket`'s key-phase logic
-  (`getKeyPhase`, `confirmKeyUpdateIfInProgress`, `computeNextApplicationTrafficSecret`). This
-  machinery **MUST be deleted**, not re-pointed: the engine owns the key-update ratchet itself via
-  `decryptPacket(KeySpace, packetNumber, keyPhase, …)` (per-packet key-phase-aware decrypt) plus
-  `setOneRttContext(QuicOneRttContext)` (§3.3). **WARN:** if this item is read literally as "keep
-  the transport, just re-point the AEAD calls," a developer will leave **two key-phase
-  authorities racing** — kwik's own ratchet and the engine's — which is both a correctness hazard
-  (disagreeing on which keys are current) and a secrecy hazard (stale/duplicate key material). The
-  transport-side ratchet must be removed, full stop.
-- **Dependency cleanup:** `at.favre.lib.hkdf` likely drops (engine derives keys). `io.whitfin.siphash`
-  stays (stateless retry token / connection-ID, transport-side). Verify before removing from
-  `module-info`.
+- **Before (as originally scoped):** kwik pulled raw traffic secrets from agent15
+  (`getClientHandshakeTrafficSecret()` …), derived its own AEAD keys via HKDF, and built its own
+  `Aes128Gcm` / `Aes256Gcm` / `ChaCha20Poly1305` ciphers, then called its own two-step
+  protect/unprotect from `QuicPacket`, for **all** key spaces.
+- **Change — DONE for Handshake/App; Initial+0-RTT deliberately kept on the legacy path (crypto-seam
+  OQ-4, signed off).** `QuicPacket`'s Handshake- and App-level two-step call sites are re-pointed
+  onto the engine's split calls via the port: `encryptPacket` / `decryptPacket` /
+  `computeHeaderProtectionMask` / `getHeaderProtectionSampleSize` / `getAuthTagSize` /
+  `keysAvailable` / `discardKeys`. **Raw secrets are never requested for those levels** — this is
+  the security point of the fork. `deriveInitialKeys` is on the port (mirrors the engine) but per
+  the follow-on §3.3 scoping work has **no production caller**: Initial-space packet protection
+  stays on `ConnectionSecrets`/`Aead` (crypto-seam OQ-4) because the engine only needs Initial-space
+  CRYPTO **bytes**, not Initial AEAD keys — the two key authorities never overlap.
+- **KEY-UPDATE — DONE, deleted not adapted.** The 1-RTT key-phase ratchet that lived
+  transport-side (`KeyUpdateSupport` plus `ShortHeaderPacket`'s `getKeyPhase` /
+  `confirmKeyUpdateIfInProgress` / `computeNextApplicationTrafficSecret`) has been **deleted**
+  (`d121bfda`), not re-pointed: the engine now owns the key-update ratchet itself via
+  `decryptPacket(KeySpace, packetNumber, keyPhase, …)` plus `setOneRttContext(QuicOneRttContext)`
+  (wired at §3.3). A dedicated test (`e8e52986`) drives a **real engine-initiated ONE_RTT
+  key-update rollover** via `jdk.quic.tls.keyLimits`, confirming there is exactly one key-phase
+  authority now, not two racing ones.
+- **Dependency cleanup — corrected from the original speculation.** `at.favre.lib.hkdf` did
+  **not** drop: it is still imported by `ConnectionSecrets.java` (`computeInitialKeys` /
+  `computeEarlySecrets`, both retained per crypto-seam OQ-4/§6.1.2's survivor list) and by
+  `Aes128Gcm`/`Aes256Gcm`/`ChaCha20`/`BaseAeadImpl`, which still serve Initial (and, until §3.5
+  strips it, 0-RTT) key material — confirmed present in `core/build.gradle:78` and 6 production
+  files as of this update. The original "likely drops" line was speculative and is corrected here,
+  not silently dropped. `io.whitfin.siphash` stays, as originally scoped (stateless retry
+  token / connection-ID, transport-side).
 
 ### 3.3 Handshake-driver seam — push callbacks → engine pull model
+
+**Status (2026-07-24): fully SCOPED and board-ratified; Stage A ready to start; not yet
+implemented.** The prose below is the SOW-level summary and remains the section's anchor, but
+`ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md` is now the **authoritative detailed scope** —
+read it, not just this section, before implementing: exhaustive file:line inventory of every
+agent15 touch point, the pull-loop's precise engine semantics (verified against source + two
+spike runs + the JGDMS `QuicEngineMtlsTest` reference), the delete-vs-repoint boundary, a staged
+A→D breakdown with gates, and the full blast radius.
+
+- **Board outcome (2026-07-21, three seats: fact-check / security-RFC / architecture):**
+  unanimous **APPROVE WITH CHANGES**. Nine blocking (MUST-FIX) corrections, all board-verified,
+  folded into the ADVICE doc — the two load-bearing ones for this SOW's prose: (a) the §6
+  state-mapping table's server-completion trigger was corrected (the original was circular /
+  deadlocked on the server side); (b) `sender.enableAppLevel()` was moved from
+  `keysAvailable(ONE_RTT)` to the server's completion step (immediately before
+  `sendHandshakeDone`) to close a pre-auth 0.5-RTT send window the original ordering opened. All
+  six Peter-level open questions (OQ-P1–OQ-P6) carried board recommendations and were **ACCEPTED
+  by Peter in full (2026-07-21)** — see the OQ-P items folded into this section, §3.4, §3.5, and
+  §5 Inc 3/4 below. A follow-up Fable design-review pass (2026-07-24) applied further amendments
+  to the ADVICE doc: struck a fail-open resumption-disable option
+  (`SSLSessionContext.setSessionCacheSize(0)` means *unlimited* cache, not disabled — see §3.5),
+  propagated the OQ-P2/P5/P6 rulings into the staged plan's named gate items, and added a Stage B
+  egress negative test (server must emit no 1-RTT bytes before the client's Finished is consumed
+  — the engine backstops ingress via `decryptPacket` but has no equivalent pre-auth gate on
+  `encryptPacket`, so this ordering has no engine backstop and must be tested directly).
+- **Stage A is ready to start.** Its sole gating open question, **OQ-P1 (builder API shape), is
+  decided** (see below); OQ-P3/OQ-P4 gate Stage B, OQ-P5/OQ-P6 gate Stage C — all four also
+  decided, so no stage is currently blocked on an open decision. Estimate for §3.3 alone:
+  **18–28 engineering-days across Stages A–D**, plus the SOW's own Inc H hardening pass
+  (1–2 weeks, §7.3a) sequenced between Stage B and Stage C — see §7.2b for how this reconciles
+  with the SOW's overall 8–12-week floor (§7.2/§7.2a).
+- **OQ-P1 (API surface) — ACCEPTED 2026-07-21, gates Stage A.** The public builder API becomes a
+  first-class `Builder.sslContext(SSLContext)` + optional `SSLParameters`, replacing the
+  agent15-typed knobs (`cipherSuite(TlsConstants.CipherSuite)`, `sessionTicket(...)`, the
+  cert/key-manager trio) — with `withCertificate`/`withKeyStore`/`noServerCertificateCheck` kept
+  as thin convenience wrappers that build an `SSLContext` internally. This also unblocks §3.6: the
+  parallel-enum alternative would have conflicted on every upstream merge and added a permanent
+  mapping to maintain.
 
 - **Files:** `core/.../impl/QuicConnectionImpl.java`, `core/.../impl/QuicClientConnectionImpl.java`,
   `core/.../server/impl/ServerConnectionImpl.java` (+ `ServerConnectionCandidate.java`,
@@ -198,15 +280,27 @@ and both packet parsers — the call sites change shape, not just their source o
   `getDelegatedTask()` is a permanent no-op (GAP-3), certificate validation (PKIX chain-path,
   possibly CRL/OCSP, plus SPIFFE-SAN matching) runs **inline on the handshake-drive thread**. kwik's
   existing DoS defenses don't cover this: `abortHandshake` is **client-only**; the server side has
-  only `maxIdleTimeout` (idle timeout is not a handshake-completion deadline) plus
-  pre-address-validation anti-amplification — neither bounds a stalled in-progress handshake. Initial
-  packets are processed on a **shared ≤10-thread pool**, so a slow or hostile peer, or a slow trust
-  manager (e.g. a hanging CRL/OCSP fetch), can pin that shared pool (slowloris-style). **Work item:**
-  add a server-side handshake-completion deadline — generous, configurable, mirroring JGDMS P1's F2
-  handshake read-progress-deadline design and default — that aborts a connection whose handshake has
-  not completed within the window. **Also require** that certificate validation run per-connection
-  (on its own virtual thread) rather than inline on the shared pool thread, so one slow trust manager
-  cannot exhaust the pool for other connections. Both parts are an **Inc-3 acceptance criterion**.
+  only `maxIdleTimeout` (idle timeout is not a handshake-completion deadline, and is resettable by
+  an attacker sending ack-eliciting handshake-space packets) plus pre-address-validation
+  anti-amplification — neither bounds a stalled in-progress handshake.
+  **Thread-model correction (board finding, ADVICE doc §0/§5 — this paragraph originally got the
+  at-risk thread wrong):** post-candidate TLS processing, including all cert-validation work, runs
+  on the connection's own dedicated `ServerConnectionThread` (one platform thread per connection),
+  **not** the shared candidate-stage pool — a hostile peer pins only its own thread. The shared pool
+  (`ServerConnectorImpl`) is exposed only at the engine-free candidate stage, which does no cert
+  work and stays that way; that pool is also, on inspection, effectively **1-thread** (an unbounded
+  `LinkedBlockingQueue` means `ThreadPoolExecutor` never grows past `corePoolSize=1`, so its real
+  exposure is queue-growth/latency, not thread-pinning). **The deadline itself is still required** —
+  it bounds (i) unbounded half-open-connection count, (ii) idle-timer resets keeping a stalled
+  handshake alive indefinitely, and (iii) a hanging trust-manager fetch — but "move cert validation
+  off the shared pool" is **already true of kwik's existing architecture**, not a new work item.
+  **Work item:** add a server-side handshake-completion deadline — generous, configurable, mirroring
+  JGDMS P1's F2 handshake read-progress-deadline design and default — that aborts a connection whose
+  handshake has not completed within the window (**OQ-P6, ACCEPTED 2026-07-21: 30s default**).
+  **OQ-P6 also adds a companion, independent bound:** a `maxConcurrentHandshakes()`-style cap on
+  in-flight (not-yet-`Confirmed`) connections, enforced at candidate-acceptance — the deadline
+  bounds half-open *lifetime*, not *concurrency*, and kwik has no connection cap today. Both the
+  deadline and the concurrency cap are **Inc-3 acceptance criteria**.
 - **Server client-auth wiring (the SPIFFE crux).** The server port must set
   `SSLParameters.setNeedClientAuth(true)` from the JGDMS `SSLContext`/config — agent15 had **no**
   server-side client-cert auth, and enabling it is the whole point of this fork. The DirtyChai mTLS
@@ -216,6 +310,15 @@ and both packet parsers — the call sites change shape, not just their source o
   Certificate → server checkClientTrusted (SPIFFE-SAN match)` — this trace's DirtyChai
   dependencies (B1/B2/B3) landed in trunk `98bcc58115f` (§6.1); the remaining predecessor is the
   functional mTLS-server test (ADVICE item D).
+  **OQ-P5 (client-auth default), ACCEPTED 2026-07-21, gates Stage C: default `needClientAuth` is
+  `true`, and it has teeth** — `CLIENT_AUTH_REQUIRED` is the only JSSE setting where a cert-less
+  client fails closed (with "want", an empty chain silently continues unauthenticated, which is
+  precisely the mission failure this fork exists to avoid). **Riders (both part of the Inc-3 gate,
+  not optional):** a caller-supplied `SSLParameters` carrying an explicit
+  `setNeedClientAuth(false)` must be a deliberate, documented opt-out — never a silent result of
+  merging caller-supplied params with the fork's true-by-default; and JGDMS's `ServerEndpoint`
+  layer should treat `SSLPeerUnverifiedException` as fatal (defense in depth on top of the fork's
+  own default).
 
 ### 3.4 Transport-parameter seam
 
@@ -233,6 +336,28 @@ and both packet parsers — the call sites change shape, not just their source o
   **Add a negative test:** peer params delayed relative to the first application frame arriving —
   assert deterministic handling (block/queue until params land), never silently proceeding with
   default or zero limits in force.
+- **OQ-P3 (per-ALPN transport params), ACCEPTED 2026-07-21, gates §3.3 Stage B.** The engine fixes
+  the server's EncryptedExtensions (transport-parameters extension included) at
+  `consumeHandshakeBytes(CH)` time, before `getApplicationProtocol()` is even readable — so
+  per-ALPN transport-parameter advertisement (upstream kwik supports it for multi-protocol
+  servers) cannot be reproduced by simply reordering calls without a hand-written CH pre-scan on
+  the candidate's attacker-controlled bytes. **Ruling: accept the regression** — advertise
+  server-wide (ALPN-independent) transport parameters, computed before the first CH byte is
+  consumed — **with an enforced-≥-advertised clamp as a named work item**: the per-protocol
+  runtime config merge (applied post-consume, once `getApplicationProtocol()` is known) may never
+  *lower* an enforced limit below its EE-advertised value. Advertising less than enforcing is
+  safe; advertising more would be a flow-control-generosity change, not a security hole — the
+  clamp forbids that direction. Zero new parsing of untrusted input at the candidate stage.
+- **OQ-P4 (version negotiation), ACCEPTED 2026-07-21, gates §3.3 Stage B.** The engine's
+  `versionNegotiated(...)` is one-shot and the EE is fixed at CH-consume time, so RFC 9369
+  compatible version negotiation (kwik's current mid-handshake V1↔V2 switch) is structurally
+  unimplementable against the engine without engine changes (advise-only DirtyChai territory).
+  **Ruling: drop RFC 9369 compatible-VN entirely, and drop the `version_information` transport
+  parameter in both directions** — advertising it while dropping its validation would violate RFC
+  9368's MUSTs, whereas omitting it outright is fully spec-legal for an endpoint not implementing
+  RFC 9368, with zero downgrade surface (no version-switch mechanism remains to downgrade to).
+  `Builder.preferredVersion` is removed as dead API. **Full Version Negotiation (`restartHandshake`
+  after a VN packet) is unaffected and stays Inc 4**, as this SOW already scoped.
 
 ### 3.5 Key-space mapping and 0-RTT exclusion
 
@@ -256,8 +381,25 @@ and both packet parsers — the call sites change shape, not just their source o
   with **no `ZERO_RTT` value** remains good code hygiene (a caller can't even construct the
   argument) but note it is **not** itself the STD's required construction-time guard — the explicit
   `max_early_data_size = 0` assertion and the send-path invariant above are what STD-010 §6.2
-  actually requires; the enum omission is a defense-in-depth nicety on top. (Non-0-RTT session
-  resumption is optional — decide separately; default: leave out for the first cut.)
+  actually requires; the enum omission is a defense-in-depth nicety on top.
+- **OQ-P2 (non-0-RTT TLS resumption), ACCEPTED 2026-07-21, gates §3.3 Stage C — RESOLVED, no
+  longer "decide separately": resumption is positively disabled for the first cut, not merely left
+  at JSSE defaults.** Finding: JSSE's TLS 1.3 PSK resumption re-admits the *original* client
+  identity **without re-running the trust manager**
+  (`PreSharedKeyExtension.canRejoin` checks only that the principal still exists, never
+  re-validates it), so a resumed session can outlive a short-lived SVID's validity window — a real
+  identity-lifetime hazard, not a hypothetical one, for JGDMS's SPIFFE reuse. **Mechanism —
+  `SSLSessionContext.setSessionCacheSize(0)` is struck from consideration**: per the JSSE contract
+  size `0` means *unlimited* cache, not disabled, so that "option" would fail open and must not be
+  implemented (struck by a follow-up Fable design-review pass, 2026-07-24, on the ADVICE doc).
+  `jdk.tls.server.newSessionTicketCount=0` remains a candidate mechanism but is a **JVM-global**
+  system property — document that caveat wherever it's used. **Preferred mechanism:** the driver
+  declines to act on the NST bytes the engine surfaces post-handshake through
+  `getHandshakeBytes(ONE_RTT)`, and explicitly invalidates any session before it could be reused.
+  The requirement is "disabled" as a **positive assertion** — a STD-010-style test that attempts
+  resumption and asserts it does not occur is the arbiter of "disabled," not the choice of
+  mechanism. Delete the `QuicSessionTicket` API entirely (accepting that RFC 9369
+  ticket-version binding, `setSessionData`, is lost with it).
 
 ### 3.6 Module descriptor
 
@@ -274,6 +416,12 @@ and both packet parsers — the call sites change shape, not just their source o
   `tech.kwik.core`** without a paired change to DirtyChai's `module-info` — record the exact
   required export line as a normative cross-repo dependency:
   `exports jdk.internal.net.quic to java.net.http, tech.kwik.core;` (see §6).
+- **§3.6's `requires tech.kwik.agent15;` removal is hostage to the OQ-P1 API decision (§3.3).**
+  OQ-P1 resolved to option (i) (`sslContext(SSLContext)` + `SSLParameters`, dropping the
+  agent15-typed builder knobs), which is the reading under which §3.6 can complete cleanly — had
+  OQ-P1 resolved to "keep source compatibility" instead, `TlsConstants.CipherSuite` would have
+  survived on the public builder and §3.6 could not complete. Recorded here so the dependency
+  stays explicit even though the decision itself is made.
 
 ---
 
@@ -293,12 +441,12 @@ and both packet parsers — the call sites change shape, not just their source o
 
 | Inc | Deliverable |
 |---|---|
-| 0 | Fork builds on the DirtyChai JDK; agent15 removed; `QuicTlsPort` wired over `QuicTLSEngine`; NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 landed (trunk `98bcc58115f`, §6.1); the mTLS-server pos/neg test (ADVICE item D) remains a **predecessor**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) landed clean 2026-07-19 (commit `994aea8a`). |
-| 1 | INITIAL+HANDSHAKE handshake completes client↔server over loopback; engine does AEAD; `getSession().getPeerCertificates()` populated both ends. |
+| 0 | Fork builds on the DirtyChai JDK; `QuicTlsPort` wired over `QuicTLSEngine` (§3.1, DONE); NOTICE file added (crediting Peter Doornbosch, marking derivative — see §7.3); DirtyChai B1/B2/B3 landed (trunk `98bcc58115f`, §6.1); the mTLS-server pos/neg test (ADVICE item D) remains a **predecessor**, not a parallel task (see §6); week-1 crypto-seam spike (§7.1) landed clean 2026-07-19 (commit `994aea8a`); **crypto seam (§3.2) itself DONE** (Steps A–D, commits `6a0ec320`…`638f4238`) — AEAD/key-update call sites re-pointed to `QuicTlsPort`, `ConnectionSecrets` reduced to the Initial+0-RTT shape, `KeyUpdateSupport` deleted. **`agent15` is not yet fully removed** — it still drives the live handshake in production until §3.3 lands (see Inc 1). |
+| 1 | INITIAL+HANDSHAKE handshake completes client↔server over loopback; engine does AEAD; `getSession().getPeerCertificates()` populated both ends. **Not yet reached**: the AEAD/key-update machinery this needs is code-complete and round-trip-tested in isolation (§3.2, DONE), but no production code constructs a `QuicTlsPortImpl` yet (`tlsPort` fields stay `null`) — that wiring is §3.3's Stage A/B, now fully scoped and board-ratified (see §3.3), not yet implemented. |
 | 2 | ONE_RTT application data; streams carry payload end-to-end; `setOneRttContext` wired (§3.3). |
-| **H** | **Adversarial-input hardening pass on the kept transport** (new — before Inc 3 mTLS; see §7.3a): fuzz harness + line-by-line audit sign-off of the nine kept transport packages; anti-amplification / Retry / stateless-reset re-verification (server/impl driver rewrite). |
-| 3 | Server accept loop with **client-auth required** (`SSLParameters.setNeedClientAuth(true)`); SPIFFE/X.500 positive **and** negative (wrong/absent identity → rejected); server handshake-completion deadline in force (§3.3 DoS item); anti-amplification re-verified. |
-| 4 | Interop against ≥1 other QUIC implementation (JDK HTTP/3 client and/or upstream kwik); Retry + Version-Negotiation paths (`restartHandshake`, §3.3). |
+| **H** | **Adversarial-input hardening pass on the kept transport** (new — before Inc 3 mTLS; see §7.3a): fuzz harness + line-by-line audit sign-off of the nine kept transport packages; anti-amplification / Retry / stateless-reset re-verification (server/impl driver rewrite). Precisely sequenced by the ADVICE doc's staged breakdown: **between §3.3 Stage B and Stage C**, unless Peter explicitly waives the ordering. |
+| 3 | Server accept loop with **client-auth required** (`SSLParameters.setNeedClientAuth(true)`, default per OQ-P5); SPIFFE/X.500 positive **and** negative (wrong/absent identity → rejected, and the OQ-P5 explicit-opt-out rider observably documented rather than silently mergeable); server handshake-completion deadline in force (§3.3 DoS item, OQ-P6: 30s default) **plus** the OQ-P6 concurrent-handshake cap enforced; a STD-010-style positive-assertion test proving TLS resumption does not occur (OQ-P2, §3.5); the STD-010 §6.2 0-RTT positive guards (`max_early_data_size=0` + ZERO_RTT send-path assertion, §3.5) as a co-requisite; anti-amplification re-verified. |
+| 4 | Interop against ≥1 other QUIC implementation (JDK HTTP/3 client and/or upstream kwik); Retry (`signRetryPacket`/`verifyRetryPacket` re-point, deferred here from §3.3 by design — both implementations are stateless/fixed-key, no dual-authority hazard, but kwik's local implementation must be deleted in the same diff) + full Version-Negotiation paths (`restartHandshake`, §3.3). RFC 9369 compatible-VN and the `version_information` transport parameter are **out** per OQ-P4 (§3.4) — this increment is full VN-via-restart only, not a revival of compatible-VN. |
 
 ---
 
@@ -403,6 +551,12 @@ present to compile at all, regardless of what they exercise at runtime.
 - **Stock-JDK caveat:** even with the engine exported, a stock OpenJDK rejects custom (non-SunJSSE)
   trust managers at `isUsableWithQuic`; only DirtyChai's B1/B2/B3 admits JGDMS's SPIFFE `AuthManager`.
   Hence DirtyChai-only, like JGDMS.
+- **Fork-side builder API (OQ-P1, §3.3): `sslContext(SSLContext)` is now the first-class input** on
+  both the client and server builders — the same `SSLContext` this section's export line and SPI
+  surface exist to make usable. `withCertificate`/`withKeyStore`/`noServerCertificateCheck` become
+  thin wrappers that build an `SSLContext` internally rather than separate agent15-typed knobs; no
+  change to the export line or SPI-surface list above, since the API decision is entirely
+  fork-side.
 
 ### 6.4 Algorithm-constraint re-imposition (inherited dependency)
 
@@ -469,7 +623,10 @@ transport can start feeding the engine INITIAL-space crypto as soon as it has th
 ID, independent of and prior to any handshake-driver wiring (§3.3). Tested at one CID length (8
 bytes) only — a promising, not fully exhaustive, data point.
 
-Gate cleared: the crypto-seam rewrite (§3.2) proceeds as scoped.
+Gate cleared: the crypto-seam rewrite (§3.2) proceeded as scoped and **landed on `master` as
+Steps A–D (2026-07-19 → 2026-07-21)** — see §3.2 for full commit evidence. The follow-on
+handshake-driver seam (§3.3) has since been scoped in the same depth
+(`ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md`) and board-ratified; see §3.3 and §7.2b.
 
 ### 7.2 Estimate — ≈ 6–8 weeks to green bidirectional mTLS + basic interop
 
@@ -508,8 +665,10 @@ driven by three items the 6–8-week table above under-weights or omits —
 - the **untrusted-transport hardening pass** (new increment, §7.3a) — **1–2 weeks**, not present in
   the 6–8-week table at all.
 
-This 8–12-week estimate is **conditional on the week-1 crypto-seam spike (§7.1) landing clean** —
-if the spike surfaces a harder reconciliation than expected, re-scope before committing further.
+This 8–12-week estimate was **conditional on the week-1 crypto-seam spike (§7.1) landing clean** —
+**it did** (§7.1: PASSED, 2026-07-19), and the crypto-seam rewrite it gated subsequently landed in
+full (§3.2, Steps A–D). §7.2b below reconciles the now-much-better-resolved remaining effort
+(§3.3's board-ratified 18–28-day estimate) against this section's floor.
 
 **Explicitly EXCLUDED from this estimate** (both were already out of scope for the 6–8-week floor,
 restated here so the correction doesn't get read as absorbing them):
@@ -521,6 +680,42 @@ restated here so the correction doesn't get read as absorbing them):
 **State plainly:** 6–8 weeks (the floor) or 8–12 weeks (the honest estimate) both yield an
 **mTLS-authenticated QUIC byte pipe** — a **prerequisite**, not the JERI transport itself. The
 `Endpoint`/`ServerEndpoint` SPI and STD-010 conformance work is a separate, subsequent effort.
+
+### 7.2b Reconciliation (2026-07-24) — §3.3's board-ratified 18–28-day estimate against the 8–12-week floor
+
+`ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md` §8 scoped §3.3 to the same file:line depth as
+the crypto-seam ADVICE doc, producing a **board-ratified 18–28 engineering-day** estimate for
+Stages A–D (A 5–7d + B 7–10d + C 3–5d + D 3–6d), replacing that document's own earlier 15–23d
+figure. This is a **refinement of, not a replacement for**, the §7.2/§7.2a table above — the two
+were built at different resolutions (this section's table estimates whole line items; the ADVICE
+doc estimates a fully-scoped staged plan) and the ADVICE doc's own §8 performs the line-by-line
+reconciliation, restated here so this SOW carries it too:
+
+- **§3.2 crypto seam is DONE** (§3.2) — the floor table's "Isolation port…" (partially, via §3.1,
+  DONE) and "Delete `ConnectionSecrets` AEAD/HKDF…" lines, plus §7.2a's +5d key-update-relocation
+  correction, are **spent**, not remaining.
+- **§3.3's 18–28 days supersede the floor table's driver-seam-related lines**: "Handshake-driver
+  pull loop … 5–8 d", "`CryptoStream` → byte pipe … 3–5 d" (§3.3 Stage A/B now owns
+  `CryptoStream`, per ADVICE finding §7 item 6 — the original SOW's §3.3 file list omitted it),
+  and the mTLS-related slice of "mTLS pos/neg + interop vs JDK HTTP/3 client … 5–8 d" (§3.3 Stage
+  C: 3–5d covers the mTLS-pos/neg half; full interop stays Inc 4, outside the 18–28d figure).
+  "Bring-up: loopback … green (Inc 1) … 3–5 d" is absorbed into Stage B's gate. "Transport-params
+  re-home … strip 0-RTT/tickets … 2–4 d" is absorbed across Stages A/B (TP re-home) and D
+  (ticket/0-RTT strip) — **not to be counted twice** on top of the 18–28d figure (ADVICE doc §8
+  double-count guard).
+- **Inc H (adversarial hardening, §7.3a) stays 1–2 weeks, additive**, sequenced between §3.3
+  Stage B and Stage C (§5 Inc H row) — unchanged from this section's original framing.
+- **Not covered by the 18–28d figure at all:** Inc 4's interop-against-another-implementation
+  work and the Retry re-point (deliberately deferred to Inc 4, §3.3/§5) — these remain open,
+  unestimated beyond this section's original figures.
+- **Net:** remaining engineering effort for Inc 0–3 ≈ 18–28 days (§3.3 Stages A–D) + 5–10 days
+  (Inc H) ≈ **23–38 engineering-days (≈ 4.6–7.6 weeks)**, one developer, on top of the
+  already-landed §3.1/§3.2 work. This is **consistent with, not a contradiction of**, this
+  section's original 8–12-week (40–60-day) floor for Inc 0–3: the crypto-seam work already spent
+  occupies the difference. Read this as the estimate gaining resolution as scoping work
+  progressed, not as a downward revision of the original floor's order of magnitude — both the
+  ADVICE doc (§8) and this reconciliation still classify these as engineering-day estimates by a
+  developer already ramped on QUIC/TLS, not calendar-time commitments.
 
 ### 7.3 Standing risks
 
@@ -573,15 +768,28 @@ they are **not** covered by the "transport kept as-is" reassurance (§2), becaus
 explicitly part of the re-pointed set, not the kept set. Re-verify all three paths after the
 server-package driver rewrite lands, and add a **spoofed-source-address amplification test** as
 part of that re-verification. Make this an explicit checkpoint gating Inc 4 (interop/Retry/
-Version-Negotiation), not an assumption carried over from the kept-transport list.
+Version-Negotiation), not an assumption carried over from the kept-transport list. Related, and
+gating §3.3 Stage B specifically (not this checkpoint): the ADVICE doc's egress negative test —
+"server emits no 1-RTT bytes before the client's Finished is consumed" — is the **sole** defense
+against a completion-step ordering regression, since the engine backstops ingress
+(`decryptPacket` refuses pre-`HANDSHAKE_CONFIRMED` 1-RTT decrypt) but has no equivalent egress
+gate on `encryptPacket` (§3.3).
 
 ---
 
 ## 8. References
 
+- **This repo (kwik fork), companion scope docs:**
+  `ADVICE-Crypto-Seam-Rewrite-Scope-2026-07-20.md` (§3.2's detailed scope — **IMPLEMENTED**, see
+  §3.2 for commit evidence); `ADVICE-Handshake-Driver-Seam-Scope-2026-07-21.md` (§3.3's detailed
+  scope — the **authoritative** source for §3.3's file:line inventory, staged A→D breakdown, and
+  blast radius; board-ratified 2026-07-21, Fable design-review amendments applied 2026-07-24; not
+  yet implemented); `ADVICE-CertificateSelectorTest-RSA-Fixture-Fix-2026-07-20.md` (unrelated
+  fixture fix, §3.1's `CertificateSelectorTest` finding).
 - **JGDMS:** `JGDMS-STD-010-QUIC-JERI-Transport-v0.1-DRAFT.md` (transport standard),
   `SOW-QUIC-JERI-Transport.md`, `ADVICE-quic-tls-exposure-2026-06-30.md`,
   `ADVICE-quic-tls-dirtychai-locations-2026-07-05.md`, `ADVICE-quic-facade-interface-2026-07-05.md`,
   `SOW-DirtyChai-QUIC-TLS-Investigation.md`.
 - **Standards:** RFC 9000 (QUIC), RFC 9001 (TLS for QUIC), RFC 9002 (loss/congestion),
-  RFC 8446 (TLS 1.3), JEP 517.
+  RFC 8446 (TLS 1.3), RFC 9368/9369 (version negotiation — compatible-VN dropped per OQ-P4, §3.4),
+  JEP 517.
