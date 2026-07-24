@@ -135,7 +135,7 @@ Class declares `implements ... TlsStatusEventHandler` (`:98`), field
 | Status callbacks (the push half being replaced) | `:581-586` `earlySecretsKnown()` (0-RTT secrets, agent15 `TrafficSecrets` via `computeEarlySecrets`); `:589-598` `handshakeSecretsKnown()` (post-Step-D: comment + `hasHandshakeKeys()` only); `:600-620` `hasHandshakeKeys()` (HandshakeState → `HasHandshakeKeys`, `currentEncryptionLevel = Handshake`, post-processing discard of Initial keys/PnSpace `:616-619`); `:623-639` `handshakeFinished()` (HandshakeState → `HasAppKeys`, `currentEncryptionLevel = App`, `connectionState = Connected`, `handshakeFinishedCondition.countDown()`); `:642-644` `newSessionTicketReceived(NewSessionTicket)`; `:647-662` `extensionsReceived(List<Extension>)` (EarlyData accept + **peer transport parameters** via `QuicTransportParametersExtension` instanceof — this is where GAP-1's push lands today, feeding `setPeerTransportParameters` `:913-967`). |
 | Blocking connect | `:387-400` | `connect()` awaits `handshakeFinishedCondition` for `connectTimeout` ms; on timeout/failure `abortHandshake()` (`:447-451`) — **the client-only handshake deadline the SOW's DoS item refers to**. |
 | Retry handling | `:731-770` | `process(RetryPacket)`: `packet.validateIntegrityTag(...)` (`:732`, kwik-local `javax.crypto`, agent15-free), `getCryptoStream(Initial).reset()` (`:742`), re-`generateInitialKeys()` (`:747`), and **re-sends the cached `originalClientHello` object** (`:759-760`) — an agent15 `ClientHello` retained at `:159/:213`. |
-| Version negotiation (compatible) | `:683-700` | `process(InitialPacket)` → `handleVersionNegotiation` → `quicVersion.setVersion(...)` + `connectionSecrets.recomputeInitialKeys()` mid-handshake; `verifyVersionNegotiation` (`:1018-1032`) checks the `version_information` transport param after the fact. |
+| Version negotiation (compatible) | `:683-700` | `process(InitialPacket)` → `handleVersionNegotiation` → `quicVersion.setVersion(...)` + `connectionSecrets.recomputeInitialKeys()` mid-handshake; `verifyVersionNegotiation` (`:1017-1032`) checks the `version_information` transport param after the fact. |
 | HANDSHAKE_DONE | `:779-794` | `process(HandshakeDoneFrame)`: HandshakeState → `Confirmed`, discard Handshake PnSpace + keys. No engine notification exists today; the engine's `tryReceiveHandshakeDone()` must be added here. |
 | Misc agent15 API surface | `:1267-1285` `addNewSessionTicket(NewSessionTicket)` / `getNewSessionTickets()`; `:1315-1317` `getServerCertificateChain()` → `tlsEngine.getServerCertificateChain()`; `:1324-1352` `trustAnyServerCertificate()` / `setTrustManager(X509TrustManager)` → `tlsEngine.setTrustManager` + `setHostnameVerifier`; builder: `cipherSuite(TlsConstants.CipherSuite)` (`:1644-1647`), `sessionTicket(...)` (`:1570-1579`), client cert/keymanager plumbing (`:1686-1719`). |
 
@@ -615,6 +615,13 @@ Cross-checked against `QuicEngineMtlsTest` (the working two-engine SPIFFE refere
   cleanup task (`ServerConnectionCandidate.java:135-137`) and `MINIMUM_NON_FINAL_CRYPTO_LENGTH`.
   No cert work ever runs here. The SOW's "require cert validation off the shared pool" is
   **already the architecture**; keep it true by never constructing an engine pre-acceptance.
+  **Nit: the pool is effectively 1-thread, not 10.** `ServerConnectorImpl.java:149-151`
+  constructs it `new ThreadPoolExecutor(1, maxSharedExecutorThreads, ..., new
+  LinkedBlockingQueue<Runnable>(), ..., new ThreadPoolExecutor.DiscardPolicy())` — an unbounded
+  `LinkedBlockingQueue` means `ThreadPoolExecutor` only grows past `corePoolSize=1` when the
+  queue *rejects* a task, which an unbounded queue never does, so `maximumPoolSize` is
+  unreachable and `DiscardPolicy` is dead code. Reframe the DoS exposure here as **queue-growth
+  and latency under load** (candidates pile up behind the single worker), not thread-pinning.
 - Connection stage: all `consumeHandshakeBytes` (hence all trust-manager work, incl. a hanging
   CRL/OCSP fetch) runs on that connection's dedicated `ServerConnectionThread`. A hostile peer
   pins **its own** thread, not the pool. Residual risks the deadline must bound: (i) unbounded
@@ -634,9 +641,16 @@ Cross-checked against `QuicEngineMtlsTest` (the working two-engine SPIFFE refere
   sender and (via `closeCallback`) deregisters. A close can't unblock a thread stuck *inside* a
   hanging trust manager (risk iii) — that thread leaks until the fetch times out; document that
   the real mitigation for (iii) is JGDMS-side (no network-fetching revocation on this path /
-  socket timeouts on the fetcher), and the deadline bounds (i)+(ii) fully. Timer ownership,
-  abort path, and test (a client that completes CH then stalls, sending periodic PINGs — assert
-  close at deadline despite idle-timer resets) = Stage C gate items.
+  socket timeouts on the fetcher), and the deadline bounds (i)+(ii) fully. **OQ-P6 addition
+  (accepted 2026-07-21, §9): the deadline bounds half-open *lifetime*, not *concurrency* — kwik
+  has no connection cap today.** A companion config item, `ServerConnectionConfig
+  .maxConcurrentHandshakes()` (or equivalent), enforced at the point a candidate is accepted into
+  a full connection (`ServerConnectionCandidate`/`ServerConnectorImpl`, §1.6), rejects or defers
+  acceptance once the in-flight (not-yet-`Confirmed`) connection count is at cap — a second,
+  independent bound alongside the per-connection timer, not a substitute for it. Timer ownership,
+  the cap's enforcement point, abort path, and test (a client that completes CH then stalls,
+  sending periodic PINGs — assert close at deadline despite idle-timer resets; a concurrency test
+  asserting the cap is enforced) = Stage C gate items.
 
 **Board addition (§11 item 17, advisory):** the deadline is part of the **AUTH story**, not
 merely an availability control — it bounds a stalling cert-less/untrusted client, not just a
@@ -664,7 +678,7 @@ under the existing `handshakeStateLock` idiom):
 |---|---|
 | `keysAvailable(HANDSHAKE)` first true | → `HasHandshakeKeys`; client: `currentEncryptionLevel = Handshake`, post-processing discard of Initial keys/PnSpace (`QuicClientConnectionImpl:600-620` body, kept verbatim); server: `currentEncryptionLevel = Handshake` |
 | `keysAvailable(ONE_RTT)` first true | `port.setOneRttContext(...)` (mandatory, §2.1) then → `HasAppKeys`. **`sender.enableAppLevel()` does NOT fire here** (board correction 2, §11 item 2 — see the completion row below) |
-| `isTLSHandshakeComplete()` first true (**client only** — board correction 1, §11 item 1) | client: `connectionState = Connected`, countdown latch (`:623-639` residue) |
+| `isTLSHandshakeComplete()` first true (**client only** — board correction 1, §11 item 1) | client: `connectionState = Connected`, **→ `HandshakeState.Completed`** (note 1's OQ-B1-endorsed revival — the window is exactly `NEED_RECV_HANDSHAKE_DONE`), countdown latch (`:623-639` residue) |
 | `getHandshakeState() == NEED_SEND_HANDSHAKE_DONE` observed after a consume/pull (**server** trigger; board correction 1, §11 item 1 — replaces the original "`isTLSHandshakeComplete()` first true" for the server half, which was circular: see Note (4) below) | server: `sender.enableAppLevel()` (board correction 2, §11 item 2 — moved here from the `keysAvailable(ONE_RTT)` row) → attempt `tryMarkHandshakeDone()`, and iff it returns true, run the completion residue → send HANDSHAKE_DONE → discard Handshake keys/PnSpace → `Connected` → **`Confirmed`** → events + app-protocol start (`:297-333` residue, order preserved) |
 | (client) HANDSHAKE_DONE frame received | `tryReceiveHandshakeDone()` + → `Confirmed` + discard Handshake keys/PnSpace (`:779-794`, kept) |
 
@@ -802,6 +816,13 @@ no-ALPN-overlap and missing-params negative cases produce the engine's own fatal
 HRR (HelloRetryRequest) case in the gate's negative tests** (OQ-B3's closure condition, §11
 item 12); **the client-rejects-untrusted-server negative test** (post-migration this is only
 observable over transport — silent coverage loss otherwise; §11 item 20, held through Stage C);
+**egress ordering negative test (correction 2, §6 note 5/§11 item 2): "server emits no 1-RTT
+bytes before the client's Finished is consumed"** — assert no datagram carrying ONE_RTT-space
+bytes leaves the server before `enableAppLevel()` fires in the completion step. This is the
+**sole** egress defense for that ordering: unlike ingress, the engine backstops nothing here
+(`encryptPacket` has no pre-auth gate — only `decryptPacket` refuses ONE_RTT decrypt
+pre-`HANDSHAKE_CONFIRMED`, `QuicTLSEngineImpl.java:348-353`), so a regression in the completion
+step's call order would not be caught by the engine and must be caught by this test;
 anti-amplification/Retry paths still pass existing tests (SOW §7.3b checkpoint opens here, closes
 Inc 4).
 
@@ -811,14 +832,26 @@ from the A–D estimate below. Both CH parse surfaces — the candidate's framin
 the engine's `consumeHandshakeBytes` — are recorded as its fuzz targets (OQ-B5, §11 item 14).
 
 **Stage C — mTLS + deadline (3–5 d).**
-`needClientAuth` config + `SSLParameters` pass-through; server peer-identity exposure (OQ-B2);
-handshake-completion deadline per §5; positive + negative mTLS tests mirroring
+`needClientAuth` config + `SSLParameters` pass-through, **including the OQ-P5 rider (§9): a
+caller-supplied `SSLParameters` carrying an explicit `setNeedClientAuth(false)` must be a
+deliberate, documented opt-out — never a silent result of merging caller-supplied params with
+the fork's true-by-default**; server peer-identity exposure (OQ-B2);
+handshake-completion deadline per §5, **including the OQ-P6 concurrent-handshaking-connections
+cap** (a companion bound on in-flight-handshake count, distinct from the deadline's per-connection
+*lifetime* bound — §5, §9 OQ-P6); **positively disabling TLS resumption per OQ-P2 (§9)** — the
+driver declines to act on NST bytes and explicitly invalidates any session before reuse, verified
+by a STD-010-style positive-assertion test, alongside the STD-010 0-RTT guards below; positive +
+negative mTLS tests mirroring
 `QuicEngineMtlsTest` over real transport (SPIFFE-shaped SVIDs if cheap, else plain X.509 pos/neg
 with the SPIFFE run deferred to JGDMS integration); slowloris test (stalling PINGing client
 closed at deadline).
 *Gate:* SOW Inc 3's acceptance criteria minus interop: client-auth required and enforced
-(wrong/absent cert → rejected), deadline in force, candidate stage demonstrably engine-free
-(code inspection + no engine construction before `createNewConnection`). **Co-requisite (board
+(wrong/absent cert → rejected, and the OQ-P5 explicit-opt-out rider observably documented rather
+than silently mergeable), deadline in force, **concurrent-handshake cap enforced (OQ-P6)**,
+candidate stage demonstrably engine-free
+(code inspection + no engine construction before `createNewConnection`), **and a
+STD-010-style positive-assertion test proving resumption does not occur (OQ-P2)**.
+**Co-requisite (board
 correction 7, §11 item 7): STD-010 §6.2's positive 0-RTT guards — the `max_early_data_size=0`
 assertion and the ZERO_RTT send-path assertion (§3.5's work items) — gate the Inc 3 acceptance
 milestone alongside this stage's own items; engine-absence is explicitly insufficient per
@@ -910,10 +943,15 @@ Explicitly untouched: the nine kept transport packages (`ack`,`cc`,`cid`,`frame`
 All six are **RESOLVED — Peter accepted every board recommendation in full (2026-07-21).** The
 board recommendation attached to each (recorded below, §11 item 16) is now Peter's ruling; the
 per-OQ entries below are marked ACCEPTED. Sequencing (§11 item 8): OQ-P1 before Stage A starts;
-OQ-P3/OQ-P4 before Stage B; OQ-P5/OQ-P6 before Stage C. (OQ-P2 mechanism — session-cache size 0
-vs `jdk.tls.server.newSessionTicketCount=0` vs driver-declines-NST — remains the implementer's
-choice at Stage build time; the accepted requirement is resumption "disabled" as a positive
-assertion.)
+OQ-P3/OQ-P4 before Stage B; OQ-P5/OQ-P6 before Stage C. (OQ-P2 mechanism — **`SSLSessionContext
+.setSessionCacheSize(0)` is struck from consideration**: per the JSSE contract, size `0` means
+*unlimited* cache, not disabled, so this "option" would fail open and must not be implemented.
+`jdk.tls.server.newSessionTicketCount=0` remains a candidate but is a **JVM-global** system
+property — a poor fit for a library that may share a process with other TLS consumers; use only
+with that caveat understood. The **preferred mechanism** is the driver declining to act on NST
+bytes plus explicit session invalidation before any reuse; the accepted requirement is resumption
+"disabled" as a positive assertion, verified by a STD-010-style positive-assertion test — that
+test, not the choice of mechanism, is the arbiter of "disabled.")
 
 - **OQ-P1 (API surface).** Public builder API: replace agent15-typed knobs
   (`cipherSuite(TlsConstants.CipherSuite)`, `sessionTicket(...)`, cert/key-manager trio) with (i)
@@ -936,9 +974,16 @@ assertion.)
   original client identity forward **without re-running the trust manager**
   (`PreSharedKeyExtension.canRejoin:446-459` checks that the principal exists, never
   re-validates), so a resumed session can outlive a short-lived SVID's validity window.
-  Mechanism (session-cache size 0 / `jdk.tls.server.newSessionTicketCount=0` / driver declines
-  NST bytes) = Peter's choice; the requirement is "disabled" as a **positive assertion**,
-  STD-010-style.
+  **Mechanism — `SSLSessionContext.setSessionCacheSize(0)` struck (fail-open hazard): per the
+  JSSE contract, `0` means *unlimited* cache size, not "disabled," so this option would silently
+  fail open and is removed from consideration entirely.**
+  `jdk.tls.server.newSessionTicketCount=0` remains a candidate mechanism but is a **JVM-global**
+  system property — a poor fit for a library that may share a process with other TLS consumers;
+  document that caveat wherever it's used. **Preferred mechanism:** the driver declines to act on
+  NST bytes surfaced via `getHandshakeBytes(ONE_RTT)` (§0 item 9/§7 item 9) and explicitly
+  invalidates any session before it could be reused. The requirement is "disabled" as a
+  **positive assertion**, STD-010-style, with a positive-assertion test (attempt resumption,
+  assert it does not occur) as the arbiter — see the Stage C work item, §8.
 - **OQ-P3 (per-ALPN transport params).** Accept §2.3 option (a)'s capability regression
   (advertised params per-server, enforced limits still per-protocol)? Recommended yes; option
   (b)'s CH pre-scan is the fallback if not.
